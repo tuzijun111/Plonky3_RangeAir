@@ -6,10 +6,13 @@ use p3_circuit::builder::{
 };
 use p3_circuit::ops::{
     ExecutionContext, NonPrimitiveExecutor, NpoConfig, NpoTypeId, Op, OpStateMap,
+    generate_permute_trace,
 };
 use p3_circuit::tables::{NonPrimitiveTrace, TraceGeneratorFn};
 use p3_circuit::{CircuitBuilderError, CircuitError, WitnessId};
-use p3_circuit_prover::batch_stark_prover::{BatchStarkProver, CircuitProverData, TablePacking};
+use p3_circuit_prover::batch_stark_prover::{
+    BatchStarkProver, CircuitProverData, TablePacking, permute_air_builders, permute_preprocessor,
+};
 use p3_circuit_prover::common::get_airs_and_degrees_with_prep;
 use p3_circuit_prover::{ConstraintProfile, config};
 use p3_field::PrimeCharacteristicRing;
@@ -330,4 +333,151 @@ fn cube_air_stark_proof() {
     let proof = prove(&cfg, &CubeAir, trace, &[]);
 
     verify(&cfg, &CubeAir, &proof, &[]).expect("CubeAir STARK proof should verify");
+}
+
+// ============================================================================
+// Permute (Phase 7a-1) — end-to-end prove + verify smoke test for `PermuteAir`.
+// ============================================================================
+
+/// Build a 4-element Permute circuit, prove + verify it end-to-end.
+///
+/// Verifies that:
+/// - The `PermuteCircuitPlugin` + `PermuteExecutor` produce a valid trace.
+/// - The `PermuteAir`'s `WitnessChecks` and `PermuteBus` interactions balance.
+/// - `BatchStarkProver` accepts the proof.
+#[test]
+fn permute_npo_stark_proof() {
+    type F = BabyBear;
+    const D: usize = 1;
+
+    // Build a circuit with 4 inputs and a Permute op.
+    let mut builder = CircuitBuilder::<F>::new();
+    builder.enable_permute(generate_permute_trace::<F, F>);
+
+    let inputs: Vec<p3_circuit::types::ExprId> = (0..4).map(|_| builder.public_input()).collect();
+    let outputs = builder
+        .add_permute(&inputs, vec![2, 0, 3, 1])
+        .expect("add_permute should accept a valid 4-element permutation");
+
+    // Trivial consistency expression to force outputs into the witness layout (mirrors cube test).
+    for &out in outputs.iter() {
+        let z = builder.sub(out, out);
+        builder.assert_zero(z);
+    }
+
+    let circuit = builder.build().expect("build permute circuit");
+    let cfg = config::baby_bear();
+
+    // Derive AIRs + preprocessed columns including PermuteAir.
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[permute_preprocessor::<F>()],
+            &permute_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    // Run the circuit to produce traces (Permute executor populates output values).
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[
+            F::from_u64(10),
+            F::from_u64(20),
+            F::from_u64(30),
+            F::from_u64(40),
+        ])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run permute circuit");
+
+    // Prove + verify all tables, including the new PermuteAir.
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_permute_table::<D>();
+
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .expect("prove_all_tables should succeed for honest permute");
+
+    prover
+        .verify_all_tables(&proof)
+        .expect("verify_all_tables should accept honest permute");
+}
+
+/// Soundness check: a "permutation_witness" that creates duplicate outputs (so the multiset of
+/// output values does NOT equal the multiset of input values) must be rejected by the
+/// `PermuteBus` balance check at verify time.
+///
+/// `[0, 0, 1, 2]` maps to `output = [in[0], in[0], in[1], in[2]]`, missing `in[3]` and
+/// duplicating `in[0]` — multisets differ unless inputs collide accidentally.
+#[test]
+fn permute_npo_stark_proof_rejects_bad_perm() {
+    type F = BabyBear;
+    const D: usize = 1;
+
+    let mut builder = CircuitBuilder::<F>::new();
+    builder.enable_permute(generate_permute_trace::<F, F>);
+
+    let inputs: Vec<p3_circuit::types::ExprId> = (0..4).map(|_| builder.public_input()).collect();
+    let outputs = builder
+        .add_permute(&inputs, vec![0, 0, 1, 2])
+        .expect("add_permute should accept the perm structurally (length matches)");
+    for &out in outputs.iter() {
+        let z = builder.sub(out, out);
+        builder.assert_zero(z);
+    }
+
+    let circuit = builder.build().expect("build permute circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[permute_preprocessor::<F>()],
+            &permute_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    let mut runner = circuit.runner();
+    // Use 4 distinct values so the bad perm produces a genuinely-different multiset.
+    runner
+        .set_public_inputs(&[
+            F::from_u64(10),
+            F::from_u64(20),
+            F::from_u64(30),
+            F::from_u64(40),
+        ])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run permute circuit");
+
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_permute_table::<D>();
+
+    // The prover may complete (the witness is consistent with the executor's view of "apply this
+    // perm") but verification MUST reject because PermuteBus does not balance.
+    let prove_result = prover.prove_all_tables(&traces, &circuit_prover_data);
+    match prove_result {
+        Ok(proof) => {
+            let verify_result = prover.verify_all_tables(&proof);
+            assert!(
+                verify_result.is_err(),
+                "verify_all_tables should reject a bad permute (PermuteBus imbalance), but it \
+                 accepted the proof"
+            );
+            eprintln!("[soundness] prove succeeded; verify rejected the bad perm — expected.");
+        }
+        Err(e) => {
+            eprintln!("[soundness] prove_all_tables refused the bad perm early: {e:?}");
+        }
+    }
 }

@@ -40,6 +40,7 @@ use crate::field_params::ExtractBinomialW;
 
 mod dynamic_air;
 mod packing;
+mod permute;
 mod poseidon1;
 mod poseidon2;
 mod recompose;
@@ -56,6 +57,7 @@ pub use poseidon2::{
     Poseidon2AirBuilder, Poseidon2AirWrapperInner, Poseidon2Preprocessor, Poseidon2Prover,
     Poseidon2ProverD2, poseidon2_preprocessor, poseidon2_verifier_air_from_config,
 };
+pub use permute::{PermuteAirBuilder, PermutePreprocessor, PermuteProver};
 pub use recompose::{RecomposeAirBuilder, RecomposePreprocessor, RecomposeProver};
 
 /// Prime modulus of the BabyBear field (`2^31 - 2^27 + 1`).
@@ -880,6 +882,26 @@ where
         self
     }
 
+    /// Register the permute (multiset-equality) table prover for extension degree `D`.
+    pub fn register_permute_table<const D: usize>(&mut self)
+    where
+        SC: Send + Sync,
+    {
+        for prover in permute_table_provers::<SC, D>(1) {
+            self.register_table_prover(prover);
+        }
+    }
+
+    /// Builder-style registration for the permute table prover.
+    #[must_use]
+    pub fn with_permute_table<const D: usize>(mut self) -> Self
+    where
+        SC: Send + Sync,
+    {
+        self.register_permute_table::<D>();
+        self
+    }
+
     /// Return the current [`TablePacking`] configuration.
     #[inline]
     pub const fn table_packing(&self) -> &TablePacking {
@@ -1636,6 +1658,37 @@ where
     } else {
         vec![Box::new(RecomposeAirBuilder::<D>::new(lanes, false))]
     }
+}
+
+/// Returns a type-erased Permute preprocessor.
+pub fn permute_preprocessor<F>() -> Box<dyn NpoPreprocessor<F>>
+where
+    F: StarkField + PrimeField,
+    PermutePreprocessor: NpoPreprocessor<F>,
+{
+    Box::new(PermutePreprocessor::new())
+}
+
+/// Permute table provers for a given extension field degree.
+pub fn permute_table_provers<SC, const D: usize>(lanes: usize) -> Vec<Box<dyn TableProver<SC>>>
+where
+    SC: StarkGenericConfig + 'static + Send + Sync,
+    Val<SC>: StarkField,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
+    vec![Box::new(PermuteProver::<D>::new(lanes))]
+}
+
+/// Permute AIR builders for a given extension field degree.
+pub fn permute_air_builders<SC, const D: usize>(lanes: usize) -> Vec<Box<dyn NpoAirBuilder<SC, D>>>
+where
+    SC: StarkGenericConfig + 'static + Send + Sync,
+    Val<SC>: StarkField,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
+    vec![Box::new(PermuteAirBuilder::<D>::new(lanes))]
 }
 
 #[cfg(test)]

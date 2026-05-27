@@ -427,6 +427,63 @@ where
     {
     }
 
+    /// Enables the permute NPO table, which proves multiset equality between an input and
+    /// output witness vector via a dedicated `PermuteBus` LogUp bus.
+    ///
+    /// `trace_generator` must convert the executor's per-row extension-field values to the
+    /// base-field coefficient layout the `PermuteAir` consumes. Typically pass
+    /// `crate::ops::permute::generate_permute_trace::<BF, F>` where `BF` is the table
+    /// prover's base field and `F` is the circuit's field; for base-field circuits use
+    /// `BF == F` so the conversion is a length-preserving identity.
+    pub fn enable_permute(&mut self, trace_generator: TraceGeneratorFn<F>)
+    where
+        F: Field + Send + Sync + 'static,
+    {
+        self.register_npo(crate::ops::permute::PermuteCircuitPlugin::<F>::new(
+            trace_generator,
+        ));
+    }
+
+    /// Add a Permute op to the circuit: `output[i] == input[permutation_witness[i]]` (by value),
+    /// proven as a multiset equality between the input and output vectors.
+    ///
+    /// Returns the freshly-allocated output `ExprId`s. The caller can `connect` them to
+    /// pre-existing expressions as needed.
+    ///
+    /// # Soundness
+    ///
+    /// The AIR only enforces `multiset(input_values) == multiset(output_values)`. It does NOT
+    /// enforce a specific permutation. Downstream constraints (e.g. sortedness via LexSortAir)
+    /// can be layered to upgrade to specific orderings.
+    pub fn add_permute(
+        &mut self,
+        input: &[ExprId],
+        permutation_witness: Vec<usize>,
+    ) -> Result<Vec<ExprId>, CircuitBuilderError> {
+        let n = input.len();
+        if permutation_witness.len() != n {
+            return Err(CircuitBuilderError::NonPrimitiveOpArity {
+                op: "Permute",
+                expected: alloc::format!("permutation_witness of length {n}"),
+                got: permutation_witness.len(),
+            });
+        }
+        let output_labels: Vec<Option<&'static str>> = (0..n).map(|_| Some("permute_out")).collect();
+        let (_op_id, _call, outputs) = self.push_non_primitive_op_with_outputs(
+            NpoTypeId::permute(),
+            vec![input.to_vec()],
+            output_labels,
+            Some(NonPrimitiveOpParams::Permute {
+                permutation_witness,
+            }),
+            "permute",
+        );
+        outputs
+            .into_iter()
+            .map(|opt| opt.ok_or(CircuitBuilderError::MissingOutput))
+            .collect()
+    }
+
     /// Checks whether an op type is enabled on this builder.
     fn is_op_enabled(&self, op: &NpoTypeId) -> bool {
         self.config.is_op_enabled(op)

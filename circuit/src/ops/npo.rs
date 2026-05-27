@@ -56,6 +56,11 @@ impl NpoTypeId {
         Self::new("recompose/coeff")
     }
 
+    /// Convenience: Permute (multiset-equality) operation type ID.
+    pub fn permute() -> Self {
+        Self::new("permute")
+    }
+
     /// Convenience: Unconstrained (hint) operation type ID.
     ///
     /// This is kept only for profiling / debugging purposes; Unconstrained is

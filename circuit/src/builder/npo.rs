@@ -18,6 +18,10 @@ pub enum NonPrimitiveOpParams<F> {
     Poseidon1Perm { new_start: bool, merkle_path: bool },
     Unconstrained { executor: Box<dyn HintExecutor<F>> },
     Recompose,
+    /// Multiset-equality permutation between an input and output witness vector.
+    /// The witness is used at trace-generation time to populate output values from inputs;
+    /// the AIR only enforces multiset equality, not the specific permutation.
+    Permute { permutation_witness: Vec<usize> },
 }
 
 impl<F> NonPrimitiveOpParams<F> {
@@ -47,6 +51,14 @@ impl<F> NonPrimitiveOpParams<F> {
     pub const fn is_recompose(&self) -> bool {
         matches!(self, Self::Recompose)
     }
+
+    /// Return the permutation witness slice if this is the [`Self::Permute`] variant.
+    pub fn as_permute(&self) -> Option<&[usize]> {
+        match self {
+            Self::Permute { permutation_witness } => Some(permutation_witness),
+            _ => None,
+        }
+    }
 }
 
 impl<F: Field> Clone for NonPrimitiveOpParams<F> {
@@ -70,6 +82,9 @@ impl<F: Field> Clone for NonPrimitiveOpParams<F> {
                 executor: executor.boxed(),
             },
             Self::Recompose => Self::Recompose,
+            Self::Permute { permutation_witness } => Self::Permute {
+                permutation_witness: permutation_witness.clone(),
+            },
         }
     }
 }

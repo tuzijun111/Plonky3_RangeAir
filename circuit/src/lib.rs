@@ -26,3 +26,5 @@ pub use expr::Expr;
 pub use ops::{AluOpKind, NpoPrivateData, NpoTypeId, Op, PreprocessedWriter};
 pub use tables::{CircuitRunner, Traces};
 pub use types::{ExprId, NonPrimitiveOpId, WitnessId};
+
+// Phase 7a-0 marker: zkSketch fork patch active.
