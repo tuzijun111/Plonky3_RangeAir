@@ -3,12 +3,14 @@ mod executor;
 mod npo;
 mod op;
 
+pub mod expose;
 pub mod hash;
 pub mod mmcs;
 pub mod perm;
 pub mod permute;
 pub mod poseidon1_perm;
 pub mod poseidon2_perm;
+pub mod range;
 pub mod recompose;
 
 pub use context::*;
@@ -44,7 +46,9 @@ pub use poseidon2_perm::{
     Poseidon2Trace,
     generate_poseidon2_trace,
 };
+pub use expose::{ExposeCircuitPlugin, ExposeCircuitRow, ExposeTrace, generate_expose_trace};
 pub use permute::{PermuteCircuitPlugin, PermuteCircuitRow, PermuteTrace, generate_permute_trace};
+pub use range::{RangeCircuitPlugin, RangeCircuitRow, RangeTrace, generate_range_trace};
 pub use recompose::{
     RecomposeCircuitRow, RecomposeTrace, RecomposeTraceKind, generate_recompose_coeff_trace,
     generate_recompose_trace,

@@ -5,11 +5,12 @@ use p3_batch_stark::{CommonData, ProverData};
 use p3_circuit::CircuitBuilder;
 use p3_circuit::ops::{
     Poseidon2Config, Poseidon2PermCall, PrimitiveOpType, generate_poseidon2_trace,
-    generate_recompose_trace,
+    generate_range_trace, generate_recompose_trace,
 };
 use p3_circuit_prover::air::{AluAir, ConstAir, PublicAir};
 use p3_circuit_prover::batch_stark_prover::{
-    PrimitiveTable, poseidon2_air_builders, recompose_air_builders,
+    PrimitiveTable, poseidon2_air_builders, range_air_builders, range_preprocessor,
+    range_table_provers, recompose_air_builders,
 };
 use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
 use p3_circuit_prover::{
@@ -691,7 +692,7 @@ fn get_verifier_inputs_and_challenges(
     let packing = batch_stark_proof.table_packing.clone();
 
     // Base field AIRs for native challenge generation
-    let native_airs = vec![
+    let mut native_airs = vec![
         CircuitTablesAir::<MyConfig, TRACE_D>::Const(ConstAir::<F, TRACE_D>::new(
             rows[PrimitiveTable::Const],
         )),
@@ -704,6 +705,22 @@ fn get_verifier_inputs_and_challenges(
             packing.alu_lanes(),
         )),
     ];
+    // Append any non-primitive AIRs present in the proof (range) so native challenge generation
+    // matches the prover's table set. Inert for proofs with no non-primitive tables (arith tests).
+    for entry in &batch_stark_proof.non_primitives {
+        if entry.op_type.as_str() == "range" {
+            let rp = range_table_provers::<MyConfig, TRACE_D>(1);
+            let air = rp[0]
+                .batch_air_from_table_entry(
+                    config,
+                    TRACE_D,
+                    batch_stark_proof.ext_degree as u32,
+                    entry,
+                )
+                .expect("reconstruct range AIR for native challenge generation");
+            native_airs.push(CircuitTablesAir::Dynamic(air));
+        }
+    }
 
     // Attach verifier without manually building circuit_airs
     let verifier_inputs = verify_p3_batch_proof_circuit::<
@@ -730,6 +747,8 @@ fn get_verifier_inputs_and_challenges(
                 ConstraintProfile::Standard,
             ))];
             tp.extend(recompose_table_provers::<_, 4>(1, false));
+            // Range table reconstruction (D=1, base-field proofs). Inert when no range table present.
+            tp.extend(range_table_provers::<MyConfig, TRACE_D>(1));
             tp
         },
     )
@@ -795,6 +814,166 @@ fn get_circuit(n: usize) -> CircuitBuilder<F> {
     builder.connect(y, expected_result);
 
     builder
+}
+
+// Base circuit combining the arith chain with a `range` NPO table: three extra public inputs,
+// each range-checked to `[0, 256)`. The resulting proof carries a real `range` table that must
+// survive recursive verification.
+fn get_range_circuit(n: usize) -> CircuitBuilder<F> {
+    let mut builder = CircuitBuilder::<F>::new();
+    builder.enable_range(generate_range_trace::<F, F>);
+
+    let x = builder.public_input();
+    let a = builder.public_input();
+    let b = builder.public_input();
+    let expected_result = builder.public_input();
+
+    let mut y = builder.mul(a, x);
+    y = builder.add(b, y);
+    for _i in 0..n {
+        y = builder.mul(a, y);
+        y = builder.add(b, y);
+    }
+    builder.connect(y, expected_result);
+
+    // Range-checked public inputs (set to in-range values by the caller).
+    let r0 = builder.public_input();
+    let r1 = builder.public_input();
+    let r2 = builder.public_input();
+    builder.add_range(&[r0, r1, r2]).unwrap();
+
+    builder
+}
+
+// Proves `get_range_circuit`, registering the range table so the proof carries a `range` entry.
+fn get_test_range_circuit_proof() -> TestCircuitProofData {
+    let n = 10;
+    let builder = get_range_circuit(n);
+    let table_packing = TablePacking::new(4, 4);
+    let config_proving = get_proving_config();
+
+    let circuit = builder.build().unwrap();
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<MyConfig, F, 1>(
+            &circuit,
+            &table_packing,
+            &[range_preprocessor::<F>()],
+            &range_air_builders::<MyConfig, 1>(1),
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+
+    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let mut runner = circuit.runner();
+
+    let init_a = 3;
+    let init_b = 5;
+    let init_x = 7;
+    let expected_result = F::from_usize(repeated_arith(init_a, init_b, init_x, n));
+
+    runner
+        .set_public_inputs(&[
+            F::from_usize(init_x),
+            F::from_usize(init_a),
+            F::from_usize(init_b),
+            expected_result,
+            // Range-checked inputs, all in [0, 256).
+            F::from_usize(0),
+            F::from_usize(123),
+            F::from_usize(255),
+        ])
+        .unwrap();
+
+    let traces = runner.run().unwrap();
+
+    let prover_data = ProverData::from_airs_and_degrees(&config_proving, &airs, &degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+
+    let mut prover = BatchStarkProver::new(config_proving).with_table_packing(table_packing);
+    prover.register_range_table::<1>();
+    let batch_stark_proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+
+    // Sanity: the proof really carries a range table.
+    assert!(
+        batch_stark_proof
+            .non_primitives
+            .iter()
+            .any(|e| e.op_type.as_str() == "range"),
+        "expected a range table in the base proof"
+    );
+
+    let (config, fri_verifier_params, pow_bits, log_height_max) = get_recursive_config_and_params();
+    let params = Parameters {
+        fri_verifier_params,
+        pow_bits,
+        log_height_max,
+    };
+    let pis = vec![vec![]; 3];
+
+    TestCircuitProofData {
+        batch_stark_proof,
+        circuit_prover_data,
+        lookup_gadget: LogUpGadget::new(),
+        config,
+        params,
+        pis,
+        prover,
+    }
+}
+
+/// End-to-end fold-propagation check: a base proof containing a `range` NPO table is recursively
+/// verified. Exercises the verifier's op_type lookup for "range", `RangeProver`'s AIR
+/// reconstruction, and the `RangeBus` global lookup surviving one recursion layer.
+#[test]
+fn test_range_recursion() {
+    let TestCircuitProofData {
+        mut batch_stark_proof,
+        circuit_prover_data,
+        lookup_gadget,
+        config,
+        params,
+        pis,
+        prover,
+    } = get_test_range_circuit_proof();
+    let common = circuit_prover_data.common_data();
+
+    // Native batch-STARK verification must accept the honest range proof.
+    prover.verify_all_tables(&batch_stark_proof).unwrap();
+
+    // Build + run the recursive verification circuit.
+    let mut circuit_builder = setup_circuit_builder();
+    let (verifier_inputs, _all_challenges) = get_verifier_inputs_and_challenges(
+        &mut circuit_builder,
+        &config,
+        &params,
+        &mut batch_stark_proof,
+        common,
+        &pis,
+        None,
+        &lookup_gadget,
+    );
+
+    let verification_circuit = circuit_builder.build().unwrap();
+    let expected_public_input_len = verification_circuit.public_flat_len;
+
+    let batch_proof = &batch_stark_proof.proof;
+    let builder = verifier_inputs
+        .as_ref()
+        .expect("verifier inputs should build for a range-containing proof");
+    let (public_inputs, private_inputs) = builder.pack_values(&pis, batch_proof, common);
+
+    assert_eq!(public_inputs.len(), expected_public_input_len);
+    assert!(!public_inputs.is_empty());
+
+    // Running the verifier circuit to completion proves the range table's constraints and
+    // RangeBus global lookup are satisfied inside the recursion.
+    let mut runner = verification_circuit.runner();
+    runner.set_public_inputs(&public_inputs).unwrap();
+    runner.set_private_inputs(&private_inputs).unwrap();
+    let _traces = runner.run().unwrap();
 }
 
 /// Test Poseidon2 with input/output CTL lookups enabled.

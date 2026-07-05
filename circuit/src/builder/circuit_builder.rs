@@ -484,6 +484,137 @@ where
             .collect()
     }
 
+    /// Enable the Expose NPO. `trace_generator` is typically
+    /// `generate_expose_trace::<BF, EF>`.
+    pub fn enable_expose(&mut self, trace_generator: TraceGeneratorFn<F>)
+    where
+        F: Field + Send + Sync + 'static,
+    {
+        self.register_npo(crate::ops::expose::ExposeCircuitPlugin::<F>::new(trace_generator));
+    }
+
+    /// Add an Expose op: read the `input` witnesses and surface their values as
+    /// `public_values` of the expose table instance (no outputs). When the
+    /// resulting proof is verified recursively, these values appear as the
+    /// parent's `air_public_targets`, bound to the input witnesses.
+    pub fn add_expose(&mut self, input: &[ExprId]) -> Result<(), CircuitBuilderError> {
+        self.push_non_primitive_op_with_outputs(
+            NpoTypeId::expose(),
+            alloc::vec![input.to_vec()],
+            alloc::vec![],
+            None,
+            "expose",
+        );
+        Ok(())
+    }
+
+    /// Enables the range NPO table, which proves each checked witness value lies in `[0, 256)`
+    /// via a LogUp lookup against a fixed 256-row byte table on a dedicated `RangeBus`.
+    ///
+    /// `trace_generator` mirrors [`Self::enable_permute`]: pass
+    /// `crate::ops::range::generate_range_trace::<BF, F>` where `BF` is the table prover's base
+    /// field and `F` the circuit's field (for base-field circuits use `BF == F`).
+    pub fn enable_range(&mut self, trace_generator: TraceGeneratorFn<F>)
+    where
+        F: Field + Send + Sync + 'static,
+    {
+        self.register_npo(crate::ops::range::RangeCircuitPlugin::<F>::new(
+            trace_generator,
+        ));
+    }
+
+    /// Add a Range op: asserts every `input[i]` value lies in `[0, 256)`. Produces no outputs.
+    ///
+    /// # Soundness
+    ///
+    /// The AIR binds each checked value to its witness (`WitnessChecks` reader) and looks it up in
+    /// a committed 256-row byte table (`RangeBus`). Wider ranges are handled by decomposing into
+    /// bytes at the caller and range-checking each byte here.
+    pub fn add_range(&mut self, input: &[ExprId]) -> Result<(), CircuitBuilderError> {
+        self.push_non_primitive_op_with_outputs(
+            NpoTypeId::range(),
+            vec![input.to_vec()],
+            Vec::new(),
+            None,
+            "range",
+        );
+        Ok(())
+    }
+
+    /// Range-check that `value` lies in `[0, 2^n_bits)` using the byte-table LogUp range check.
+    ///
+    /// Decomposes coefficient 0 of `value` into `ceil(n_bits/8)` little-endian bytes, constrains
+    /// the reconstruction `value == Σ byte_i · 256^i` (which also forces the higher extension
+    /// coefficients of `value` to zero), and looks each byte up in the shared 256-row byte table
+    /// via [`Self::add_range`]. When `n_bits` is not a multiple of 8, the most-significant byte is
+    /// left-shifted by `8 - (n_bits mod 8)` so its lookup tightens the bound to `[0, 2^r)`.
+    ///
+    /// Drop-in replacement for `decompose_to_bits::<BF>(value, n_bits)` when used purely for a
+    /// range check: same `[0, 2^n_bits)` guarantee, but `O(ceil(n_bits/8))` shared-table lookups
+    /// instead of `n_bits` in-circuit boolean constraints. Requires [`Self::enable_range`].
+    pub fn add_range_bits<BF>(
+        &mut self,
+        value: ExprId,
+        n_bits: usize,
+    ) -> Result<(), CircuitBuilderError>
+    where
+        F: ExtensionField<BF>,
+        BF: PrimeField64,
+    {
+        assert!(n_bits >= 1, "add_range_bits: n_bits must be >= 1");
+        assert!(
+            n_bits <= BF::bits(),
+            "add_range_bits: n_bits {n_bits} exceeds base field width {}",
+            BF::bits()
+        );
+
+        self.push_scope("add_range_bits");
+        let k = n_bits.div_ceil(8);
+
+        // Hint the k little-endian bytes of value's coefficient 0.
+        let bytes: Vec<ExprId> = self
+            .push_unconstrained_op(
+                vec![vec![value]],
+                k,
+                ByteDecompositionHint::<BF>::new(),
+                "add_range_bits",
+            )
+            .2
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(CircuitBuilderError::MissingOutput)?;
+
+        // Materialize each byte as an ALU output so it has a `WitnessChecks` creator that accounts
+        // for the extra read performed by `add_range` (an NPO reader). Then constrain
+        // `value == Σ byte_i · 256^i` on coefficient 0 only.
+        let zero = self.define_const(F::ZERO);
+        let mut acc = zero;
+        let mut byte_wires: Vec<ExprId> = Vec::with_capacity(k);
+        for (i, &byte_hint) in bytes.iter().enumerate() {
+            let byte = self.add(byte_hint, zero);
+            byte_wires.push(byte);
+            let pow = self.define_const(F::from_u64(1u64 << (8 * i)));
+            acc = self.mul_add(byte, pow, acc);
+        }
+        self.connect(value, acc);
+
+        // Range-check each byte in [0, 256); tighten the most-significant byte when `n_bits`
+        // isn't byte-aligned by left-shifting it before the lookup.
+        let r = n_bits - 8 * (k - 1); // bits in the most-significant byte, in 1..=8
+        for (i, &byte) in byte_wires.iter().enumerate() {
+            if i + 1 < k || r == 8 {
+                self.add_range(&[byte])?;
+            } else {
+                let shift = self.define_const(F::from_u64(1u64 << (8 - r)));
+                let shifted = self.mul(byte, shift);
+                self.add_range(&[shifted])?;
+            }
+        }
+
+        self.pop_scope();
+        Ok(())
+    }
+
     /// Checks whether an op type is enabled on this builder.
     fn is_op_enabled(&self, op: &NpoTypeId) -> bool {
         self.config.is_op_enabled(op)
@@ -1883,6 +2014,81 @@ impl<BF: PrimeField64, EF: ExtensionField<BF>> HintExecutor<EF> for BinaryDecomp
                 } else {
                     *slot = Some(bit);
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn boxed(&self) -> alloc::boxed::Box<dyn HintExecutor<EF>> {
+        Box::new(self.clone())
+    }
+}
+
+/// Hint executor that fills each output witness with a little-endian byte of coefficient 0 of the
+/// input extension-field value: `output[i] = (coeff0(input) >> (8*i)) & 0xFF`. Used by
+/// [`CircuitBuilder::add_range_bits`]; the reconstruction constraint pins the higher coefficients
+/// to zero, so decomposing coefficient 0 alone is sound.
+#[derive(Debug, Clone)]
+struct ByteDecompositionHint<BF: PrimeField64> {
+    _phantom: PhantomData<BF>,
+}
+
+impl<BF: PrimeField64> ByteDecompositionHint<BF> {
+    pub const fn new() -> Self {
+        Self {
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<BF: PrimeField64, EF: ExtensionField<BF>> HintExecutor<EF> for ByteDecompositionHint<BF> {
+    fn execute(
+        &self,
+        inputs: &[crate::WitnessId],
+        outputs: &[crate::WitnessId],
+        witness: &mut [Option<EF>],
+    ) -> Result<(), CircuitError> {
+        if inputs.len() != 1 {
+            return Err(CircuitError::UnconstrainedOpInputLengthMismatch {
+                op: "ByteDecompositionHint".to_string(),
+                expected: 1,
+                got: inputs.len(),
+            });
+        }
+
+        let in_wid = inputs[0];
+        let in_idx = in_wid.0 as usize;
+        let ext_val = witness
+            .get(in_idx)
+            .and_then(|opt| opt.as_ref())
+            .map(Dup::dup)
+            .ok_or(CircuitError::WitnessNotSet { witness_id: in_wid })?;
+
+        let witness_len = witness.len();
+        let coeffs = ext_val.as_basis_coefficients_slice();
+        let val0 = coeffs[0].as_canonical_u64();
+
+        for (i, &out_wid) in outputs.iter().enumerate() {
+            let byte = (val0 >> (8 * i)) & 0xFF;
+            let byte_ef = EF::from_u64(byte);
+
+            let out_idx = out_wid.0 as usize;
+            if out_idx >= witness_len {
+                return Err(CircuitError::WitnessIdOutOfBounds { witness_id: out_wid });
+            }
+            let slot = &mut witness[out_idx];
+            if let Some(existing) = slot.as_ref() {
+                if *existing != byte_ef {
+                    return Err(CircuitError::WitnessConflict {
+                        witness_id: out_wid,
+                        existing: format!("{existing:?}"),
+                        new: format!("{byte_ef:?}"),
+                        expr_ids: vec![],
+                    });
+                }
+            } else {
+                *slot = Some(byte_ef);
             }
         }
 

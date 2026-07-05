@@ -135,6 +135,17 @@ where
 
     /// Operation IDs that require private data (e.g. Merkle paths) for the circuit runner.
     fn op_ids(&self) -> &[NonPrimitiveOpId];
+
+    /// Per-instance AIR public-input targets allocated during recursive
+    /// verification — the in-circuit wires holding the verified child's
+    /// surfaced public values (e.g. an Expose table's values). Empty by
+    /// default; backends that surface non-primitive public values override it.
+    /// Enables custom aggregation circuits to constrain / re-expose a
+    /// verified child's public values (see the in-circuit boundary-bound
+    /// streaming forest).
+    fn air_public_targets(&self) -> alloc::vec::Vec<alloc::vec::Vec<crate::Target>> {
+        alloc::vec::Vec::new()
+    }
 }
 
 /// PCS-specific backend for building verifier circuits and setting private data.
@@ -503,7 +514,7 @@ where
 /// and one `BatchStark` right) or identical ones.
 #[instrument(skip_all)]
 #[allow(clippy::type_complexity)]
-fn build_aggregation_layer_circuit<SC, A1, A2, B, const D: usize>(
+pub fn build_aggregation_layer_circuit<SC, A1, A2, B, const D: usize>(
     left: &RecursionInput<'_, SC, A1>,
     right: &RecursionInput<'_, SC, A2>,
     config: &SC,

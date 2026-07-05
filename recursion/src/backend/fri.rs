@@ -7,18 +7,20 @@ use alloc::{format, vec};
 
 use p3_circuit::{CircuitBuilder, CircuitRunner, NonPrimitiveOpId};
 use p3_circuit_prover::batch_stark_prover::{
-    permute_air_builders, permute_preprocessor, permute_table_provers, poseidon1_air_builders,
+    expose_air_builders, expose_preprocessor, expose_table_provers, permute_air_builders,
+    permute_preprocessor, permute_table_provers, poseidon1_air_builders,
     poseidon1_air_builders_d5, poseidon1_preprocessor, poseidon1_table_provers_d5,
     poseidon2_air_builders, poseidon2_air_builders_d5, poseidon2_preprocessor,
-    poseidon2_table_provers_d5, recompose_air_builders, recompose_preprocessor,
+    poseidon2_table_provers_d5, range_air_builders, range_preprocessor, range_table_provers,
+    recompose_air_builders, recompose_preprocessor,
 };
 use p3_circuit_prover::common::{NpoAirBuilder, NpoPreprocessor};
 use p3_circuit_prover::config::StarkField;
 use p3_circuit_prover::field_params::ExtractBinomialW;
 use p3_circuit_prover::{
-    ConstraintProfile, PermutePreprocessor, Poseidon1Preprocessor, Poseidon1Prover,
+    ConstraintProfile, ExposePreprocessor, PermutePreprocessor, Poseidon1Preprocessor, Poseidon1Prover,
     Poseidon1ProverD2, Poseidon2Preprocessor, Poseidon2Prover, Poseidon2ProverD2,
-    RecomposePreprocessor, TableProver, recompose_table_provers,
+    RangePreprocessor, RecomposePreprocessor, TableProver, recompose_table_provers,
 };
 use p3_commit::Pcs;
 use p3_field::extension::BinomiallyExtendable;
@@ -277,6 +279,13 @@ where
             Self::UniStark(_, ids) | Self::BatchStark(_, ids) => ids,
         }
     }
+
+    fn air_public_targets(&self) -> alloc::vec::Vec<alloc::vec::Vec<crate::Target>> {
+        match self {
+            Self::BatchStark(vi, _) => vi.air_public_targets.clone(),
+            Self::UniStark(vi, _) => alloc::vec![vi.air_public_targets.clone()],
+        }
+    }
 }
 
 fn build_verifier_circuit_impl<SC, A, const WIDTH: usize, const RATE: usize, C>(
@@ -452,6 +461,8 @@ where
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
     PermutePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposePreprocessor: NpoPreprocessor<Val<SC>>,
+    RangePreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -521,6 +532,8 @@ where
             perm_prep,
             recompose_preprocessor::<Val<SC>>(cl),
             permute_preprocessor::<Val<SC>>(),
+            expose_preprocessor::<Val<SC>>(),
+            range_preprocessor::<Val<SC>>(),
         ]
     }
 
@@ -543,6 +556,8 @@ where
             };
             provers.extend(recompose_table_provers::<SC, 2>(self.0.recompose_lanes, cl));
             provers.extend(permute_table_provers::<SC, 2>(1));
+            provers.extend(expose_table_provers::<SC, 2>());
+            provers.extend(range_table_provers::<SC, 2>(1));
             provers
         } else {
             Vec::new()
@@ -558,6 +573,8 @@ where
         };
         builders.extend(recompose_air_builders::<SC, 2>(self.0.recompose_lanes, cl));
         builders.extend(permute_air_builders::<SC, 2>(1));
+        builders.extend(expose_air_builders::<SC, 2>());
+        builders.extend(range_air_builders::<SC, 2>(1));
         builders
     }
 }
@@ -573,6 +590,8 @@ where
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
     PermutePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposePreprocessor: NpoPreprocessor<Val<SC>>,
+    RangePreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -642,6 +661,8 @@ where
             perm_prep,
             recompose_preprocessor::<Val<SC>>(cl),
             permute_preprocessor::<Val<SC>>(),
+            expose_preprocessor::<Val<SC>>(),
+            range_preprocessor::<Val<SC>>(),
         ]
     }
 
@@ -664,6 +685,8 @@ where
             };
             provers.extend(recompose_table_provers::<SC, 4>(self.0.recompose_lanes, cl));
             provers.extend(permute_table_provers::<SC, 4>(1));
+            provers.extend(expose_table_provers::<SC, 4>());
+            provers.extend(range_table_provers::<SC, 4>(1));
             provers
         } else {
             Vec::new()
@@ -679,6 +702,8 @@ where
         };
         builders.extend(recompose_air_builders::<SC, 4>(self.0.recompose_lanes, cl));
         builders.extend(permute_air_builders::<SC, 4>(1));
+        builders.extend(expose_air_builders::<SC, 4>());
+        builders.extend(range_air_builders::<SC, 4>(1));
         builders
     }
 }
@@ -694,6 +719,8 @@ where
     Poseidon2Preprocessor: NpoPreprocessor<Val<SC>>,
     RecomposePreprocessor: NpoPreprocessor<Val<SC>>,
     PermutePreprocessor: NpoPreprocessor<Val<SC>>,
+    ExposePreprocessor: NpoPreprocessor<Val<SC>>,
+    RangePreprocessor: NpoPreprocessor<Val<SC>>,
     SC::Challenge: BasedVectorSpace<Val<SC>>
         + From<Val<SC>>
         + ExtensionField<Val<SC>>
@@ -763,6 +790,8 @@ where
             perm_prep,
             recompose_preprocessor::<Val<SC>>(cl),
             permute_preprocessor::<Val<SC>>(),
+            expose_preprocessor::<Val<SC>>(),
+            range_preprocessor::<Val<SC>>(),
         ]
     }
 
@@ -779,6 +808,8 @@ where
             };
             provers.extend(recompose_table_provers::<SC, 5>(self.0.recompose_lanes, cl));
             provers.extend(permute_table_provers::<SC, 5>(1));
+            provers.extend(expose_table_provers::<SC, 5>());
+            provers.extend(range_table_provers::<SC, 5>(1));
             provers
         } else {
             Vec::new()
@@ -794,6 +825,8 @@ where
         };
         builders.extend(recompose_air_builders::<SC, 5>(self.0.recompose_lanes, cl));
         builders.extend(permute_air_builders::<SC, 5>(1));
+        builders.extend(expose_air_builders::<SC, 5>());
+        builders.extend(range_air_builders::<SC, 5>(1));
         builders
     }
 }

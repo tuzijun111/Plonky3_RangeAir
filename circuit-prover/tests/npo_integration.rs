@@ -6,16 +6,18 @@ use p3_circuit::builder::{
 };
 use p3_circuit::ops::{
     ExecutionContext, NonPrimitiveExecutor, NpoConfig, NpoTypeId, Op, OpStateMap,
-    generate_permute_trace,
+    generate_permute_trace, generate_range_trace,
 };
 use p3_circuit::tables::{NonPrimitiveTrace, TraceGeneratorFn};
 use p3_circuit::{CircuitBuilderError, CircuitError, WitnessId};
 use p3_circuit_prover::batch_stark_prover::{
     BatchStarkProver, CircuitProverData, TablePacking, permute_air_builders, permute_preprocessor,
+    range_air_builders, range_preprocessor,
 };
 use p3_circuit_prover::common::get_airs_and_degrees_with_prep;
 use p3_circuit_prover::{ConstraintProfile, config};
 use p3_field::PrimeCharacteristicRing;
+use p3_field::extension::BinomialExtensionField;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_test_utils::baby_bear_params::*;
 
@@ -480,4 +482,261 @@ fn permute_npo_stark_proof_rejects_bad_perm() {
             eprintln!("[soundness] prove_all_tables refused the bad perm early: {e:?}");
         }
     }
+}
+
+// ============================================================================
+// Range (byte-table LogUp) — end-to-end prove + verify + reject-out-of-range.
+// ============================================================================
+
+/// Build a circuit with 4 public inputs, all in `[0, 256)`, range-check them, prove + verify.
+///
+/// Verifies that the `RangeAir` lookup rows + fixed 256-row byte table balance on `RangeBus`
+/// and the checked values bind to their witnesses on `WitnessChecks`.
+#[test]
+fn range_npo_stark_proof() {
+    type F = BabyBear;
+    const D: usize = 1;
+
+    let mut builder = CircuitBuilder::<F>::new();
+    builder.enable_range(generate_range_trace::<F, F>);
+
+    let inputs: Vec<p3_circuit::types::ExprId> = (0..4).map(|_| builder.public_input()).collect();
+    builder
+        .add_range(&inputs)
+        .expect("add_range should accept the inputs");
+
+    let circuit = builder.build().expect("build range circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[range_preprocessor::<F>()],
+            &range_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[
+            F::from_u64(0),
+            F::from_u64(42),
+            F::from_u64(200),
+            F::from_u64(255),
+        ])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run range circuit");
+
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_range_table::<D>();
+
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .expect("prove_all_tables should succeed for in-range values");
+
+    prover
+        .verify_all_tables(&proof)
+        .expect("verify_all_tables should accept in-range values");
+}
+
+/// Soundness check: a value `>= 256` has no matching byte-table row, so `RangeBus` cannot balance
+/// and verification MUST reject.
+#[test]
+fn range_npo_stark_proof_rejects_out_of_range() {
+    type F = BabyBear;
+    const D: usize = 1;
+
+    let mut builder = CircuitBuilder::<F>::new();
+    builder.enable_range(generate_range_trace::<F, F>);
+
+    let inputs: Vec<p3_circuit::types::ExprId> = (0..4).map(|_| builder.public_input()).collect();
+    builder
+        .add_range(&inputs)
+        .expect("add_range should accept the inputs");
+
+    let circuit = builder.build().expect("build range circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[range_preprocessor::<F>()],
+            &range_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    let mut runner = circuit.runner();
+    // 300 >= 256 — out of range.
+    runner
+        .set_public_inputs(&[
+            F::from_u64(1),
+            F::from_u64(2),
+            F::from_u64(300),
+            F::from_u64(255),
+        ])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run range circuit");
+
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_range_table::<D>();
+
+    // The out-of-range value (300) produces a `RangeBus` imbalance. Depending on build config this
+    // surfaces one of three ways, all of which mean "rejected":
+    //   - the dev-build debug lookup checker panics during proving,
+    //   - `prove_all_tables` returns an error, or
+    //   - `verify_all_tables` returns an error.
+    // `accepted == true` only if a full proof both builds AND verifies — a genuine soundness break.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match prover.prove_all_tables(&traces, &circuit_prover_data) {
+            Ok(proof) => prover.verify_all_tables(&proof).is_ok(),
+            Err(_) => false,
+        }
+    }));
+    std::panic::set_hook(prev_hook);
+
+    let accepted = matches!(outcome, Ok(true));
+    assert!(
+        !accepted,
+        "an out-of-range value (300 >= 256) must be rejected, but a proof was produced and verified"
+    );
+    eprintln!("[soundness] out-of-range value rejected via {outcome:?} — expected.");
+}
+
+// ============================================================================
+// add_range_bits (byte-decomposition helper) at D=4 — the GK integration path.
+// ============================================================================
+
+/// Prove + verify a 22-bit range check on an ALU-derived value in a **D=4** extension-field
+/// circuit — the configuration GK's `bandmerge2` uses. Exercises the multi-coefficient path:
+/// the reconstruction forces the checked value's higher coefficients to zero, the byte lookups
+/// bind via `WitnessChecks` at arity `1 + D`, and the non-byte-aligned top limb (22 = 2·8 + 6)
+/// is range-checked shifted.
+#[test]
+fn range_bits_d4_prove_verify() {
+    type BF = BabyBear;
+    type EF = BinomialExtensionField<BabyBear, 4>;
+    const D: usize = 4;
+
+    let mut builder = CircuitBuilder::<EF>::new();
+    builder.enable_range(generate_range_trace::<BF, EF>);
+
+    // ALU-derived value: d = a - b, chosen so 0 <= d < 2^22 (mirrors GK's key_inv_diff).
+    let a = builder.public_input();
+    let b = builder.public_input();
+    let d = builder.sub(a, b);
+    builder
+        .add_range_bits::<BF>(d, 22)
+        .expect("add_range_bits should accept a 22-bit check");
+
+    let circuit = builder.build().expect("build d4 range_bits circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[range_preprocessor::<BF>()],
+            &range_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    let mut runner = circuit.runner();
+    // a - b = 3_000_000 < 2^22 = 4_194_304.
+    runner
+        .set_public_inputs(&[EF::from_u64(3_000_050), EF::from_u64(50)])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run d4 range_bits circuit");
+
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_range_table::<D>();
+
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .expect("prove_all_tables should succeed for an in-range 22-bit value");
+
+    prover
+        .verify_all_tables(&proof)
+        .expect("verify_all_tables should accept an in-range 22-bit value");
+}
+
+/// Soundness: a value `>= 2^22` must be rejected by `add_range_bits(_, 22)` — the shifted
+/// top-limb lookup (or the low-byte lookups) cannot balance `RangeBus`.
+#[test]
+fn range_bits_d4_rejects_out_of_range() {
+    type BF = BabyBear;
+    type EF = BinomialExtensionField<BabyBear, 4>;
+    const D: usize = 4;
+
+    let mut builder = CircuitBuilder::<EF>::new();
+    builder.enable_range(generate_range_trace::<BF, EF>);
+
+    let a = builder.public_input();
+    let b = builder.public_input();
+    let d = builder.sub(a, b);
+    builder
+        .add_range_bits::<BF>(d, 22)
+        .expect("add_range_bits should accept the check structurally");
+
+    let circuit = builder.build().expect("build d4 range_bits circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[range_preprocessor::<BF>()],
+            &range_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+
+    let mut runner = circuit.runner();
+    // a - b = 5_000_000 >= 2^22 — out of range.
+    runner
+        .set_public_inputs(&[EF::from_u64(5_000_050), EF::from_u64(50)])
+        .expect("set public inputs");
+    let traces = runner.run().expect("run d4 range_bits circuit");
+
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_range_table::<D>();
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match prover.prove_all_tables(&traces, &circuit_prover_data) {
+            Ok(proof) => prover.verify_all_tables(&proof).is_ok(),
+            Err(_) => false,
+        }
+    }));
+    std::panic::set_hook(prev_hook);
+
+    let accepted = matches!(outcome, Ok(true));
+    assert!(
+        !accepted,
+        "a 23-bit value must be rejected by add_range_bits(_, 22), but it was accepted"
+    );
+    eprintln!("[soundness] out-of-range 22-bit value rejected via {outcome:?} — expected.");
 }

@@ -61,6 +61,20 @@ impl NpoTypeId {
         Self::new("permute")
     }
 
+    /// Convenience: Range (byte-table membership, value ∈ [0, 256)) operation type ID.
+    pub fn range() -> Self {
+        Self::new("range")
+    }
+
+    /// Convenience: Expose (public-value surfacing) operation type ID.
+    ///
+    /// Reads K input witnesses and surfaces their values as the table
+    /// instance's `public_values`, so they propagate as recursion
+    /// `air_public_targets` when the proof is verified recursively.
+    pub fn expose() -> Self {
+        Self::new("expose")
+    }
+
     /// Convenience: Unconstrained (hint) operation type ID.
     ///
     /// This is kept only for profiling / debugging purposes; Unconstrained is
