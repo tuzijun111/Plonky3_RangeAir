@@ -1414,6 +1414,34 @@ where
         })
     }
 
+    /// Rebuild the verifier-side [`CommonData`] for `proof`: the preprocessed
+    /// binding carried by `proof.stark_common` plus the per-instance lookups
+    /// re-derived from AIRs reconstructed from the proof metadata.
+    ///
+    /// The serialized `stark_common` intentionally omits the lookup contexts
+    /// (see `serde_stark_common`), so a proof that crossed a process/machine
+    /// boundary deserializes with empty `lookups` and cannot be fed to the
+    /// recursive verifier (`RecursionInput::BatchStark`) as-is. This exposes
+    /// the exact reconstruction `verify_all_tables` performs internally; the
+    /// proof's non-primitive table provers must be registered on `self`, as
+    /// for verification.
+    pub fn rebuild_common_data(
+        &self,
+        proof: &BatchStarkProof<SC>,
+    ) -> Result<CommonData<SC>, BatchStarkProverError> {
+        proof.validate()?;
+        let common = &proof.stark_common;
+        match proof.ext_degree {
+            1 => self.reconstruct_context::<1>(proof, None, common).map(|c| c.2),
+            2 => self.reconstruct_context::<2>(proof, proof.w_binomial, common).map(|c| c.2),
+            4 => self.reconstruct_context::<4>(proof, proof.w_binomial, common).map(|c| c.2),
+            5 => self.reconstruct_context::<5>(proof, proof.w_binomial, common).map(|c| c.2),
+            6 => self.reconstruct_context::<6>(proof, proof.w_binomial, common).map(|c| c.2),
+            8 => self.reconstruct_context::<8>(proof, proof.w_binomial, common).map(|c| c.2),
+            d => Err(BatchStarkProverError::UnsupportedDegree(d)),
+        }
+    }
+
     /// Verify a batch STARK proof for a specific extension field degree.
     ///
     /// This reconstructs the AIRs from the proof metadata and verifies the proof
@@ -1425,6 +1453,22 @@ where
         w_binomial: Option<Val<SC>>,
         common: &CommonData<SC>,
     ) -> Result<(), BatchStarkProverError> {
+        let (airs, pvs, effective_common) =
+            self.reconstruct_context::<D>(proof, w_binomial, common)?;
+        p3_batch_stark::verify_batch(&self.config, &airs, &proof.proof, &pvs, &effective_common)
+            .map_err(|e| BatchStarkProverError::Verify(format!("{e:?}")))
+    }
+
+    /// Reconstruct the verification context (AIRs in prove order, per-table
+    /// public values, effective [`CommonData`]) from proof metadata.
+    #[allow(clippy::type_complexity)]
+    fn reconstruct_context<const D: usize>(
+        &self,
+        proof: &BatchStarkProof<SC>,
+        w_binomial: Option<Val<SC>>,
+        common: &CommonData<SC>,
+    ) -> Result<(Vec<CircuitTableAir<SC, D>>, Vec<Vec<Val<SC>>>, CommonData<SC>), BatchStarkProverError>
+    {
         let prover_index_by_type: BTreeMap<NpoTypeId, usize> = self
             .non_primitive_provers
             .iter()
@@ -1506,8 +1550,7 @@ where
             lookups,
         );
 
-        p3_batch_stark::verify_batch(&self.config, &airs, &proof.proof, &pvs, &effective_common)
-            .map_err(|e| BatchStarkProverError::Verify(format!("{e:?}")))
+        Ok((airs, pvs, effective_common))
     }
 }
 
