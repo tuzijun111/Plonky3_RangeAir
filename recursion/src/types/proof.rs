@@ -169,7 +169,14 @@ where
             .preprocessed
             .as_ref()
             .map(|prep| GlobalPreprocessedTargets {
-                commitment: Comm::new(circuit, &prep.commitment),
+                // Bake the preprocessed commitment (the child's verification key)
+                // in as circuit constants, not free public inputs. This makes the
+                // verifying circuit's own preprocessed trace — hence its VK —
+                // depend on the child's VK, so a single trusted root-VK check
+                // transitively anchors every child in the recursion tree. Trace
+                // and quotient commitments (proof-carried, per-instance) stay as
+                // regular inputs; only this preprocessed VK is pinned.
+                commitment: Comm::new_const(circuit, &prep.commitment),
                 instances: PreprocessedInstanceMetas {
                     instances: prep.instances.clone(),
                 },
@@ -184,14 +191,12 @@ where
         }
     }
 
-    fn get_values(input: &Self::Input) -> Vec<SC::Challenge> {
-        let mut values = vec![];
-        if let Some(prep) = &input.preprocessed {
-            values.extend(Comm::get_values(&prep.commitment));
-        }
-
-        // Lookups are given symbolically, so we don't need to extract concrete values here.
-        values
+    fn get_values(_input: &Self::Input) -> Vec<SC::Challenge> {
+        // The preprocessed commitment is baked in as circuit constants by `new`
+        // (via `Comm::new_const`), so it contributes no public-input values here.
+        // Lookups are given symbolically, so we don't extract concrete values here
+        // either. Hence there are no common-data public-input values to pack.
+        vec![]
     }
 }
 

@@ -337,6 +337,7 @@ impl<F: Field> Circuit<F> {
                     let out_already_defined =
                         (out.0 as usize) < defined.len() && defined[out.0 as usize];
                     let b_already_defined = (b.0 as usize) < defined.len() && defined[b.0 as usize];
+                    let a_already_defined = (a.0 as usize) < defined.len() && defined[a.0 as usize];
 
                     // 3-state for a and c:
                     //   0 = skip (not defined, not private/hint → unconstrained)
@@ -379,12 +380,39 @@ impl<F: Field> Circuit<F> {
                     });
 
                     // b and out creator flags (now independent).
-                    // Private inputs can be b-creators even in the forward case.
-                    let b_is_private_creator =
-                        !b_already_defined && private_input_wids.contains(&b.0);
+                    // Private inputs AND hint outputs can be b-creators even in the
+                    // forward case. (The `a` path already allows both; the `b` path
+                    // previously checked only private inputs, so a hint output — e.g.
+                    // a decompose coefficient — whose first ALU use was as the `b`
+                    // operand never got a WitnessChecks creator, unbalancing the bus.)
+                    let b_aliased_by_out = !out_already_defined && b.0 == out.0;
+                    let b_is_private_creator = !b_already_defined
+                        && (private_input_wids.contains(&b.0) || hint_output_wids.contains(&b.0))
+                        && !b_aliased_by_out;
+                    // Backward-encoded op (e.g. `sub` lowers to `rhs + result = lhs`)
+                    // whose `out = lhs` is a HINT output — hints carry their own value
+                    // and are not marked `defined` by the Hint op, so `out_already_defined`
+                    // is false. Here the row does NOT create `out` from scratch: given the
+                    // known `a` (= rhs) and the hint value at `out`, it SOLVES for `b`
+                    // (= result). So `b` is a created value too, alongside the hint `out`.
+                    // Without this, the solved `result` never gets a WitnessChecks creator
+                    // and the bus is unbalanced (surfaces on the D=2 decompose-heavy path).
+                    // `a` (= rhs) is "known" if it is already defined, or if it is a
+                    // private input / hint output (which carry their own value).
+                    let a_known = a_already_defined
+                        || private_input_wids.contains(&a.0)
+                        || hint_output_wids.contains(&a.0);
+                    let out_hint_solves_b = !out_already_defined
+                        && hint_output_wids.contains(&out.0)
+                        && a_known
+                        && !b_already_defined
+                        && !b_aliased_by_out
+                        && a.0 != b.0;
                     let out_is_creator = F::from_bool(!out_already_defined);
                     let b_is_creator = F::from_bool(
-                        b_is_private_creator || out_already_defined && !b_already_defined,
+                        b_is_private_creator
+                            || (out_already_defined && !b_already_defined)
+                            || out_hint_solves_b,
                     );
 
                     preprocessed.primitive[PrimitiveOpType::Alu as usize].extend([

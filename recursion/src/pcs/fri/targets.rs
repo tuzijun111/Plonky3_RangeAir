@@ -386,6 +386,22 @@ impl<F: Field, EF: ExtensionField<F>, const DIGEST_ELEMS: usize> Recursive<EF>
         }
     }
 
+    fn new_const(circuit: &mut CircuitBuilder<EF>, input: &Self::Input) -> Self {
+        let cap_targets = input
+            .roots()
+            .iter()
+            .map(|entry: &[<F as PackedValue>::Value; DIGEST_ELEMS]| {
+                core::array::from_fn(|i| {
+                    circuit.alloc_const(EF::from(entry[i]), "preprocessed VK cap entry (baked const)")
+                })
+            })
+            .collect();
+        Self {
+            cap_targets,
+            _phantom: PhantomData,
+        }
+    }
+
     fn get_values(input: &Self::Input) -> Vec<EF> {
         input
             .roots()

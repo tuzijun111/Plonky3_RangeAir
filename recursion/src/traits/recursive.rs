@@ -26,6 +26,25 @@ pub trait Recursive<F: Field> {
     /// - `input`: The non-recursive input (used only for structure, not values)
     fn new(circuit: &mut CircuitBuilder<F>, input: &Self::Input) -> Self;
 
+    /// Like [`new`](Self::new), but bakes the input's concrete field values in as
+    /// circuit **constants** rather than allocating free public/private inputs.
+    ///
+    /// The default forwards to [`new`](Self::new) (i.e. free inputs), so behavior
+    /// is unchanged unless a type overrides it. Override this for a commitment
+    /// that must be pinned into a recursive verifier's *preprocessed* trace: a
+    /// child's preprocessed commitment baked as a constant makes the parent's own
+    /// verification key depend on it, so a single trusted root-VK check
+    /// transitively anchors the whole recursion tree (closing the gap where the
+    /// verifier trusts a proof-carried child VK). A type overriding this must not
+    /// emit the corresponding values from [`get_values`](Self::get_values), since
+    /// no public inputs are allocated for them.
+    fn new_const(circuit: &mut CircuitBuilder<F>, input: &Self::Input) -> Self
+    where
+        Self: Sized,
+    {
+        Self::new(circuit, input)
+    }
+
     /// Extracts private field element values from the input.
     ///
     /// Values returned here will be used to populate private inputs during execution.
