@@ -160,6 +160,27 @@ impl<F: Field + Send + Sync + 'static> NonPrimitiveExecutor<F> for PermuteExecut
         self
     }
 
+    /// Swap in a fresh `permutation_witness` (same length) so a built circuit
+    /// can be re-run on new witness data. Sound because the AIR only proves
+    /// multiset equality — the specific permutation is a trace-generation hint.
+    fn set_params(&mut self, params: &NonPrimitiveOpParams<F>) -> Result<(), CircuitError> {
+        let sigma =
+            params.as_permute().ok_or_else(|| CircuitError::NonPrimitiveOpParamsMismatch {
+                op: self.op_type.clone(),
+                expected: "NonPrimitiveOpParams::Permute".to_string(),
+                got: format!("{params:?}"),
+            })?;
+        if sigma.len() != self.permutation_witness.len() {
+            return Err(CircuitError::NonPrimitiveOpParamsMismatch {
+                op: self.op_type.clone(),
+                expected: format!("permutation of length {}", self.permutation_witness.len()),
+                got: format!("length {}", sigma.len()),
+            });
+        }
+        self.permutation_witness = sigma.to_vec();
+        Ok(())
+    }
+
     /// Preprocessed layout: 5 columns per (input, output) pair (one pair per AIR row).
     ///
     /// Per pair:

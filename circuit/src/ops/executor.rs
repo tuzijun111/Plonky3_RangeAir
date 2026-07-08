@@ -8,6 +8,7 @@ use p3_field::Field;
 use super::context::ExecutionContext;
 use super::npo::NpoTypeId;
 use crate::CircuitError;
+use crate::builder::NonPrimitiveOpParams;
 use crate::types::WitnessId;
 
 /// Object-safe trait exposing the subset of [`PreprocessedColumns`](crate::PreprocessedColumns)
@@ -105,6 +106,22 @@ pub trait NonPrimitiveExecutor<F: Field>: Debug {
 
     /// Allow downcasting to concrete executor types
     fn as_any(&self) -> &dyn Any;
+
+    /// Replace this executor's per-op parameters inside a **built** circuit.
+    ///
+    /// The circuit graph of ops whose parameters are only trace-generation
+    /// hints (e.g. a `Permute` op's `permutation_witness` — its AIR proves
+    /// multiset equality regardless of the specific permutation) is otherwise
+    /// witness-independent, so swapping the hint lets one built circuit (and
+    /// the prover data derived from it) be reused across proofs instead of
+    /// being rebuilt per witness. Executors without runtime-replaceable
+    /// parameters reject the update (the default).
+    fn set_params(&mut self, params: &NonPrimitiveOpParams<F>) -> Result<(), CircuitError> {
+        let _ = params;
+        Err(CircuitError::NonPrimitiveOpParamsNotUpdatable {
+            op: self.op_type().clone(),
+        })
+    }
 
     /// Update the preprocessed values related to this operation. This consists of:
     /// - the preprocessed values for the associated table

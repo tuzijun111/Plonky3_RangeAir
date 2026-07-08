@@ -518,6 +518,45 @@ impl<F: Field> Circuit<F> {
     pub fn runner(&self) -> CircuitRunner<'_, F> {
         CircuitRunner::new(self)
     }
+
+    /// Replace the `permutation_witness` of every `Permute` op, in op order.
+    ///
+    /// A built circuit's graph is witness-independent except for the Permute
+    /// executors' baked permutation hints (the PermuteAir proves only multiset
+    /// equality; the hint only guides trace generation). Swapping the hints
+    /// lets one built circuit — and the prover data derived from it — be
+    /// reused across proofs instead of being rebuilt per witness.
+    ///
+    /// `sigmas` must hold exactly one permutation per Permute op, in the order
+    /// the ops were added by the builder; each must match its op's length.
+    pub fn update_permute_witnesses(&mut self, sigmas: &[Vec<usize>]) -> Result<(), CircuitError> {
+        let mut next = 0usize;
+        for op in &mut self.ops {
+            if let Op::NonPrimitiveOpWithExecutor { executor, .. } = op
+                && *executor.op_type() == NpoTypeId::permute()
+            {
+                let sigma = sigmas.get(next).ok_or_else(|| {
+                    CircuitError::NonPrimitiveOpParamsMismatch {
+                        op: NpoTypeId::permute(),
+                        expected: alloc::format!("more than {next} permutation witnesses"),
+                        got: alloc::format!("{}", sigmas.len()),
+                    }
+                })?;
+                executor.set_params(&crate::builder::NonPrimitiveOpParams::Permute {
+                    permutation_witness: sigma.clone(),
+                })?;
+                next += 1;
+            }
+        }
+        if next != sigmas.len() {
+            return Err(CircuitError::NonPrimitiveOpParamsMismatch {
+                op: NpoTypeId::permute(),
+                expected: alloc::format!("{next} permutation witnesses"),
+                got: alloc::format!("{}", sigmas.len()),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

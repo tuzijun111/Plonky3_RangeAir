@@ -30,6 +30,18 @@ pub enum CircuitError {
     #[error("NonPrimitiveOpId {op_id} out of range (circuit has {max_ops} complex ops)")]
     NonPrimitiveOpIdOutOfRange { op_id: u32, max_ops: usize },
 
+    /// The executor's per-op parameters cannot be replaced after build.
+    #[error("non-primitive op {op:?} does not support post-build parameter updates")]
+    NonPrimitiveOpParamsNotUpdatable { op: NpoTypeId },
+
+    /// A post-build parameter update did not match the built op's shape.
+    #[error("non-primitive op {op:?} parameter update mismatch: expected {expected}, got {got}")]
+    NonPrimitiveOpParamsMismatch {
+        op: NpoTypeId,
+        expected: String,
+        got: String,
+    },
+
     /// Public input not set for a WitnessId.
     #[error("Public input not set for WitnessId({witness_id})")]
     PublicInputNotSet { witness_id: WitnessId },
