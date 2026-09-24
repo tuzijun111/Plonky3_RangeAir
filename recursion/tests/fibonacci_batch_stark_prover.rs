@@ -110,6 +110,7 @@ fn test_fibonacci_batch_verifier() {
         scalars.log_final_poly_len,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
+        scalars.num_queries,
         Poseidon2Config::KOALA_BEAR_D4_W16,
     );
     let config = make_test_config();
@@ -324,6 +325,7 @@ fn recursive_verifier_ignores_supplied_lookups() {
         scalars.log_final_poly_len,
         scalars.commit_pow_bits,
         scalars.query_pow_bits,
+        scalars.num_queries,
         Poseidon2Config::KOALA_BEAR_D4_W16,
     );
     let config = make_test_config();
@@ -379,6 +381,174 @@ fn recursive_verifier_ignores_supplied_lookups() {
         ),
         Err(e) => panic!("a collapsed lookup set was not ignored by the verifier: {e}"),
     }
+}
+
+/// Build, run, prove and verify the recursive verifier circuit for `proof`.
+fn verify_fib_batch_proof_recursively(
+    proof: &p3_circuit_prover::batch_stark_prover::BatchStarkProof<MyConfig>,
+    common: &p3_batch_stark::CommonData<MyConfig>,
+    fri_verifier_params: &FriVerifierParams,
+) -> Result<(), String> {
+    let config = make_test_config();
+    let lookup_gadget = LogUpGadget::new();
+    let num_tables = common
+        .preprocessed
+        .as_ref()
+        .map(|g| g.instances.len())
+        .unwrap_or(0);
+    let pis: Vec<Vec<F>> = vec![vec![]; num_tables];
+
+    let mut circuit_builder = CircuitBuilder::new();
+    circuit_builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+        generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+        default_koalabear_poseidon2_16(),
+    );
+    circuit_builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+    let mut tp: Vec<Box<dyn TableProver<MyConfig>>> = vec![Box::new(Poseidon2Prover::new(
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+        ConstraintProfile::Standard,
+    ))];
+    tp.extend(recompose_table_provers::<_, 4>(1, false));
+    let (verifier_inputs, mmcs_op_ids) = verify_p3_batch_proof_circuit::<
+        MyConfig,
+        MerkleCapTargets<F, DIGEST_ELEMS>,
+        InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+        InnerFri,
+        LogUpGadget,
+        _,
+        WIDTH,
+        RATE,
+        1,
+    >(
+        &config,
+        &mut circuit_builder,
+        proof,
+        fri_verifier_params,
+        common,
+        &lookup_gadget,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+        &tp,
+    )
+    .map_err(|e| format!("verifier circuit construction: {e:?}"))?;
+    let verification_circuit = circuit_builder
+        .build()
+        .map_err(|e| format!("build: {e:?}"))?;
+    let (public_inputs, private_inputs) = verifier_inputs.pack_values(&pis, &proof.proof, common);
+
+    let verification_table_packing = TablePacking::new(1, 8);
+    let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
+        Box::new(Poseidon2Preprocessor),
+        Box::new(RecomposePreprocessor::default()),
+    ];
+    let mut air_builders = poseidon2_air_builders::<_, 4>();
+    air_builders.extend(recompose_air_builders(1, false));
+    let (vad, vpc, vnpc) = get_airs_and_degrees_with_prep::<MyConfig, _, 4>(
+        &verification_circuit,
+        &verification_table_packing,
+        &npo_prep,
+        &air_builders,
+        ConstraintProfile::Standard,
+    )
+    .map_err(|e| format!("airs: {e:?}"))?;
+    let (vairs, vdegs): (Vec<_>, Vec<usize>) = vad.into_iter().unzip();
+
+    let mut runner = verification_circuit.runner();
+    runner
+        .set_public_inputs(&public_inputs)
+        .map_err(|e| format!("{e:?}"))?;
+    runner
+        .set_private_inputs(&private_inputs)
+        .map_err(|e| format!("{e:?}"))?;
+    set_fri_mmcs_private_data::<F, Challenge, ChallengeMmcs, MyMmcs, MyHash, MyCompress, DIGEST_ELEMS>(
+        &mut runner,
+        &mmcs_op_ids,
+        &proof.proof.opening_proof,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    )
+    .map_err(|e| e.to_string())?;
+    let traces = runner.run().map_err(|e| format!("run: {e:?}"))?;
+
+    let config3 = make_test_config();
+    let vpd = ProverData::from_airs_and_degrees(&config3, &vairs, &vdegs);
+    let vcpd = CircuitProverData::new(vpd, vpc, vnpc);
+    let mut vprover = BatchStarkProver::new(config3).with_table_packing(verification_table_packing);
+    vprover.register_poseidon2_table::<4>(Poseidon2Config::KOALA_BEAR_D4_W16);
+    vprover.register_recompose_table::<4>(false);
+    let vproof = vprover
+        .prove_all_tables(&traces, &vcpd)
+        .map_err(|e| format!("prove: {e:?}"))?;
+    vprover
+        .verify_all_tables(&vproof)
+        .map_err(|e| format!("verify: {e:?}"))
+}
+
+/// Regression for upstream 125da1e: the recursive FRI verifier must require at least the
+/// configured number of query proofs. The circuit is built from the proof's shape, so without
+/// the check a proof whose FRI part carries a single query is verified with a single query.
+#[test]
+fn recursive_verifier_rejects_too_few_fri_queries() {
+    let n: usize = 20;
+    let mut builder = CircuitBuilder::new();
+    let expected_result = builder.alloc_public_input("expected_result");
+    let mut a = builder.alloc_const(F::ZERO, "F(0)");
+    let mut b = builder.alloc_const(F::ONE, "F(1)");
+    for _i in 2..=n {
+        let next = builder.add(a, b);
+        a = b;
+        b = next;
+    }
+    builder.connect(b, expected_result);
+    let circuit = builder.build().unwrap();
+
+    let table_packing = TablePacking::new(2, 4);
+    let config_proving = make_test_config();
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<MyConfig, _, 1>(
+            &circuit,
+            &table_packing,
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[compute_fibonacci_classical(n)])
+        .unwrap();
+    let traces = runner.run().unwrap();
+    let prover_data = ProverData::from_airs_and_degrees(&config_proving, &airs, &degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let prover = BatchStarkProver::new(config_proving).with_table_packing(table_packing);
+    let proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+    let common = circuit_prover_data.common_data();
+
+    let scalars = test_fri_scalars();
+    let fri_verifier_params = FriVerifierParams::with_mmcs(
+        scalars.log_blowup,
+        scalars.log_final_poly_len,
+        scalars.commit_pow_bits,
+        scalars.query_pow_bits,
+        scalars.num_queries,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    );
+
+    verify_fib_batch_proof_recursively(&proof, common, &fri_verifier_params)
+        .expect("honest proof must verify recursively");
+
+    let mut truncated = proof;
+    let q = truncated.proof.opening_proof.query_proofs.len();
+    assert!(q > 1, "test FRI config must use more than one query");
+    truncated.proof.opening_proof.query_proofs.truncate(1);
+    let res = verify_fib_batch_proof_recursively(&truncated, common, &fri_verifier_params);
+    println!("single-query proof (honest has {q}): {res:?}");
+    assert!(
+        res.is_err(),
+        "a proof carrying 1 of {q} required FRI queries must be rejected"
+    );
 }
 
 fn compute_fibonacci_classical(n: usize) -> F {
