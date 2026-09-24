@@ -394,18 +394,37 @@ where
 
     // Iterate air builders first (fixed registration order) so that the
     // resulting AIR ordering matches the prover's non_primitive_provers order.
+    //
+    // `non_primitive_base` is a `HashMap` with a randomly seeded hasher, so its iteration order
+    // differs between maps and processes. A builder that accepts more than one of the circuit's
+    // op types (e.g. a Poseidon2 builder with two Poseidon2 configurations in one circuit) would
+    // build whichever came first, making the AIR set, and so the verifying key, depend on hash
+    // order. Scan the op types in sorted order and refuse such a builder: each one must match at
+    // most one op type, which it then always builds.
+    let mut op_types: Vec<&NpoTypeId> = non_primitive_base.keys().collect();
+    op_types.sort_unstable();
     for builder in non_primitive_air_builders {
-        for (op_type, prep_base) in non_primitive_base.iter() {
+        let mut built = None;
+        for &op_type in &op_types {
+            let prep_base = &non_primitive_base[op_type];
             // TablePacking overrides the builder's own default lane count.
             let lanes = packing
                 .npo_lanes(op_type)
                 .unwrap_or_else(|| builder.lanes());
-            if let Some((air, degree)) =
+            if let Some(air_and_degree) =
                 builder.try_build(op_type, prep_base, min_height, lanes, constraint_profile)
             {
-                table_preps.push((air, degree));
-                break;
+                if built.is_some() {
+                    return Err(CircuitError::InvalidPreprocessing {
+                        reason: "a non-primitive AIR builder accepts more than one of the \
+                                 circuit's non-primitive op types",
+                    });
+                }
+                built = Some(air_and_degree);
             }
+        }
+        if let Some(air_and_degree) = built {
+            table_preps.push(air_and_degree);
         }
     }
 
