@@ -1764,7 +1764,10 @@ where
                 // branch value it was decomposed from before the selects read them.
                 let saved_ctl = self.recompose_coeff_ctl_for_decompose_links;
                 self.recompose_coeff_ctl_for_decompose_links = false;
-                let saved_alu = core::mem::replace(&mut self.decompose_recompose_via_alu, true);
+                let branch_via_alu = self.decompose_recompose_via_alu
+                    || !(self.bind_recompose_coeffs && self.recompose_npo_enabled);
+                let saved_alu =
+                    core::mem::replace(&mut self.decompose_recompose_via_alu, branch_via_alu);
                 let t_coeffs = match t_coeffs_opt {
                     Some(c) => c,
                     None => self.decompose_ext_to_base_coeffs::<BF>(t)?,
@@ -1781,7 +1784,7 @@ where
                 for (&tc, &sc) in t_coeffs.iter().zip(s_coeffs.iter()) {
                     coeffs.push(self.select(b, tc, sc));
                 }
-                if saved_ctl || self.bind_recompose_coeffs {
+                if saved_ctl || (self.bind_recompose_coeffs && self.recompose_npo_enabled) {
                     // The select coefficients are what enter Poseidon2 rate slots, so they
                     // need a coeff-ctl entry. Emit one for x now that the selects are known.
                     // Binding mode needs it too: the selects are ALU images of the branch
