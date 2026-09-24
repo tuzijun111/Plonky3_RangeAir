@@ -114,6 +114,12 @@ where
         ..
     } = opened_values_targets;
 
+    // `degree_bits` feeds `1 << degree_bits` below; validate bounds up front (parity with
+    // native p3-uni-stark) instead of shift-overflowing or building a degenerate domain
+    // from a crafted proof.
+    p3_uni_stark::validate_degree_bits(None, *degree_bits, config.is_zk())
+        .map_err(|e| VerificationError::InvalidProofShape(format!("{e:?}")))?;
+
     let degree = 1 << degree_bits;
     let lookup_gadget = LogUpGadget {};
     let preprocessed_width = opt_opened_preprocessed_local_targets

@@ -412,6 +412,14 @@ where
         ));
     }
 
+    // Proof-supplied degree_bits feed `1 << degree_bits` below; validate bounds up front
+    // (parity with native p3-batch-stark/p3-uni-stark) instead of shift-overflowing or
+    // building a degenerate domain from a crafted proof.
+    for (i, &db) in degree_bits.iter().enumerate() {
+        p3_uni_stark::validate_degree_bits(Some(i), db, config.is_zk())
+            .map_err(|e| VerificationError::InvalidProofShape(format!("{e:?}")))?;
+    }
+
     // `common` is consumed by per-instance indexing below (`common.lookups[i]`,
     // `global.instances.instances[i]`, and `matrix_to_instance` lookups). Validate
     // its lengths and bounds up front so malformed/mismatched `CommonData` returns
