@@ -91,6 +91,10 @@ pub struct CircuitBuilder<F: Field> {
     /// sponge chain constraint (see [`Self::add_poseidon2_perm_for_challenger_chained`]).
     /// `build` checks that `next` is the row right after `prev` in their table.
     sponge_chain_links: Vec<(NonPrimitiveOpId, NonPrimitiveOpId)>,
+
+    /// Lowers every NPO recomposition through `recompose/coeff` when set (the default; see
+    /// [`Self::set_bind_recompose_coeffs`]).
+    bind_recompose_coeffs: bool,
 }
 
 impl<F> Default for CircuitBuilder<F>
@@ -125,6 +129,7 @@ where
             recompose_coeff_ctl_for_decompose_links: false,
             decompose_recompose_via_alu: false,
             sponge_chain_links: Vec::new(),
+            bind_recompose_coeffs: true,
         }
     }
 
@@ -132,6 +137,33 @@ where
     /// `recompose/coeff` table (needed with D=1 Poseidon2 over a higher-degree extension field).
     pub const fn set_recompose_coeff_ctl_for_decompose_links(&mut self, enabled: bool) {
         self.recompose_coeff_ctl_for_decompose_links = enabled;
+    }
+
+    /// Toggle whether every recomposition lowered through the recompose NPO table publishes its
+    /// coefficients on the `WitnessChecks` bus. On by default.
+    ///
+    /// When on, [`Self::recompose_base_coeffs_to_ext`] and the reconnect inside
+    /// [`Self::decompose_ext_to_base_coeffs`] both use the `recompose/coeff` table, whose row
+    /// publishes each coefficient as `[coeff_idx, v_i, 0, .., 0]` next to
+    /// `[output_idx, v_0, .., v_{D-1}]`. That ties every coefficient witness to the packed value
+    /// and pins it to the base field, so a decomposition is unique and a recomposition's output
+    /// is determined by its inputs. The prover must register the `recompose/coeff` table
+    /// (`split_coeff_tables = true`); a circuit that emits its rows without the table fails to
+    /// prove rather than proving unbound.
+    ///
+    /// When off, both lower through the plain `recompose` table, whose row publishes only
+    /// `[output_idx, v_0, .., v_{D-1}]` from free main-trace columns. The coefficient witnesses
+    /// are then tied to nothing: a decomposition hands back prover-chosen coefficients and an
+    /// explicit recomposition's output is prover-chosen. Only for soundness proofs-of-concept
+    /// and cost comparisons against the unbound lowering.
+    pub const fn set_bind_recompose_coeffs(&mut self, enabled: bool) {
+        self.bind_recompose_coeffs = enabled;
+    }
+
+    /// Whether NPO recompositions publish their coefficients (see
+    /// [`Self::set_bind_recompose_coeffs`]).
+    pub const fn binds_recompose_coeffs(&self) -> bool {
+        self.bind_recompose_coeffs
     }
 
     /// Register a circuit-layer NPO plugin.
@@ -1488,9 +1520,9 @@ where
     /// [`Self::decompose_ext_to_base_coeffs`] on that output can return the same `coeffs`
     /// without extra witness rows (this path **does** constrain recomposition via the recompose AIR).
     ///
-    /// Uses the standard recompose AIR (no per-coefficient WitnessChecks receives). Prefer
-    /// [`Self::recompose_base_coeffs_to_ext_with_coeff_lookups`] when the coefficient targets
-    /// are read by a lower-degree Poseidon2 (e.g. D=1) after decomposition.
+    /// Uses the `recompose/coeff` table (per-coefficient WitnessChecks lookups) unless
+    /// [`Self::set_bind_recompose_coeffs`] was turned off, in which case it uses the plain
+    /// recompose table and the output is NOT bound to `coeffs`.
     pub fn recompose_base_coeffs_to_ext<BF>(
         &mut self,
         coeffs: &[ExprId],
@@ -1599,7 +1631,7 @@ where
         }
 
         let result = if self.recompose_npo_enabled && !force_alu {
-            self.recompose_via_npo(coeffs, coeff_lookups)?
+            self.recompose_via_npo(coeffs, coeff_lookups || self.bind_recompose_coeffs)?
         } else {
             self.push_scope("recompose_base_coeffs_to_ext");
 
@@ -1664,7 +1696,10 @@ where
     ///
     /// # Constraints Added
     /// - D witness allocations for coefficients (via `ExtDecompositionHint`)
-    /// - 1 recomposition constraint: `sum(c_i * basis_i) == x`
+    /// - 1 recomposition constraint: `sum(c_i * basis_i) == x`. With the recompose NPO enabled
+    ///   and [`Self::set_bind_recompose_coeffs`] on (the default) this is a `recompose/coeff` row,
+    ///   which also pins every returned coefficient to the base field. With it off the row binds
+    ///   only its own free columns to `x`, and the returned coefficients are unconstrained.
     ///
     /// # Cost
     /// - If `x` is the output of `recompose_base_coeffs_to_ext` (same builder, modulo `connect`
@@ -1738,9 +1773,12 @@ where
                 for (&tc, &sc) in t_coeffs.iter().zip(s_coeffs.iter()) {
                     coeffs.push(self.select(b, tc, sc));
                 }
-                if saved_ctl {
+                if saved_ctl || self.bind_recompose_coeffs {
                     // The select coefficients are what enter Poseidon2 rate slots, so they
                     // need a coeff-ctl entry. Emit one for x now that the selects are known.
+                    // Binding mode needs it too: the selects are ALU images of the branch
+                    // coefficients, and `select` does not constrain `b` to be boolean, so
+                    // nothing else pins them to base-field values that sum to `x`.
                     let reconstructed =
                         self.recompose_base_coeffs_to_ext_with_coeff_lookups::<BF>(&coeffs)?;
                     self.connect(x, reconstructed);

@@ -189,7 +189,10 @@ where
 /// NpoPreprocessor for the recompose table(s).
 ///
 /// Converts EF preprocessed data to BF and sets `out_mult` from `ext_reads`.
-/// When `split_coeff_tables` is true, emits separate base rows for `recompose` and `recompose/coeff`.
+/// Always emits separate base rows for `recompose` and `recompose/coeff` (each only when the
+/// circuit has rows of that type): `CircuitBuilder` lowers recompositions through
+/// `recompose/coeff` by default (`set_bind_recompose_coeffs`). `split_coeff_tables` is kept for
+/// API compatibility and no longer narrows the output.
 #[derive(Default, Clone)]
 pub struct RecomposePreprocessor {
     pub split_coeff_tables: bool,
@@ -274,19 +277,20 @@ where
     F: StarkField + PrimeField64,
     EF: Field + ExtensionField<F> + 'static,
 {
+    // Both op types, whatever `split_coeff_tables` says: dropping `recompose/coeff` here would
+    // leave its rows without preprocessed data, i.e. without their coefficient bus lookups.
+    let _ = split_coeff_tables;
     let mut result = HashMap::new();
     result.extend(recompose_preprocess_for_op::<F, EF, D>(
         prep,
         &NpoTypeId::recompose(),
         false,
     )?);
-    if split_coeff_tables {
-        result.extend(recompose_preprocess_for_op::<F, EF, D>(
-            prep,
-            &NpoTypeId::recompose_with_coeff_lookups(),
-            true,
-        )?);
-    }
+    result.extend(recompose_preprocess_for_op::<F, EF, D>(
+        prep,
+        &NpoTypeId::recompose_with_coeff_lookups(),
+        true,
+    )?);
     Ok(result)
 }
 

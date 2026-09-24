@@ -1804,7 +1804,9 @@ where
 
 /// Returns a type-erased Recompose preprocessor.
 ///
-/// When `split_coeff_tables` is true, preprocesses both `recompose` and `recompose/coeff` rows.
+/// Preprocesses both `recompose` and `recompose/coeff` rows. `split_coeff_tables` is kept for API
+/// compatibility: `CircuitBuilder` lowers recompositions through `recompose/coeff` by default
+/// (`set_bind_recompose_coeffs`), so every circuit may carry those rows.
 pub fn recompose_preprocessor<F>(split_coeff_tables: bool) -> Box<dyn NpoPreprocessor<F>>
 where
     F: StarkField + PrimeField,
@@ -1815,8 +1817,9 @@ where
 
 /// Recompose table provers for a given extension field degree.
 ///
-/// When `split_coeff_tables` is true, returns both the standard table and the `recompose/coeff`
-/// variant.
+/// Returns both the standard table and the `recompose/coeff` variant; a table whose op type has
+/// no rows in the circuit is absent from the proof. `split_coeff_tables` is kept for API
+/// compatibility (see [`recompose_preprocessor`]).
 pub fn recompose_table_provers<SC, const D: usize>(
     lanes: usize,
     split_coeff_tables: bool,
@@ -1827,19 +1830,17 @@ where
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
         Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
 {
-    if split_coeff_tables {
-        vec![
-            Box::new(RecomposeProver::<D>::new(lanes, false)),
-            Box::new(RecomposeProver::<D>::new(lanes, true)),
-        ]
-    } else {
-        vec![Box::new(RecomposeProver::<D>::new(lanes, false))]
-    }
+    let _ = split_coeff_tables;
+    vec![
+        Box::new(RecomposeProver::<D>::new(lanes, false)),
+        Box::new(RecomposeProver::<D>::new(lanes, true)),
+    ]
 }
 
 /// Recompose AIR builders for a given extension field degree.
 ///
-/// `split_coeff_tables` must match the value used in the paired [`recompose_table_provers`].
+/// Returns builders for both the standard table and `recompose/coeff`, matching
+/// [`recompose_table_provers`]. `split_coeff_tables` is kept for API compatibility.
 pub fn recompose_air_builders<SC, const D: usize>(
     lanes: usize,
     split_coeff_tables: bool,
@@ -1850,14 +1851,11 @@ where
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
         Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
 {
-    if split_coeff_tables {
-        vec![
-            Box::new(RecomposeAirBuilder::<D>::new(lanes, false)),
-            Box::new(RecomposeAirBuilder::<D>::new(lanes, true)),
-        ]
-    } else {
-        vec![Box::new(RecomposeAirBuilder::<D>::new(lanes, false))]
-    }
+    let _ = split_coeff_tables;
+    vec![
+        Box::new(RecomposeAirBuilder::<D>::new(lanes, false)),
+        Box::new(RecomposeAirBuilder::<D>::new(lanes, true)),
+    ]
 }
 
 /// Returns a type-erased Permute preprocessor.
