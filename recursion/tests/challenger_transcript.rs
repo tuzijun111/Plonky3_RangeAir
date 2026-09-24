@@ -397,6 +397,58 @@ mod baby_bear_d4 {
         assert!(traces.witness_trace.num_rows() > 0);
     }
 
+    /// `clear` after the challenger has already permuted must restart the sponge from the zero
+    /// state, capacity included. The test above observes fewer than `RATE` values before
+    /// clearing, so no permutation runs and a stale sponge chain cannot show up there.
+    ///
+    /// Here the pre-clear transcript runs two permutations (`RATE + 3` observations, then a
+    /// sample), and everything after the clear must match a fresh native challenger. A cleared
+    /// challenger that still continued the pre-clear permutation's sponge chain would chain the
+    /// old capacity into its next permutation and produce different challenges
+    /// (`WitnessConflict` on the connect).
+    #[test]
+    fn test_transcript_clear_after_duplexing_matches_fresh_challenger() {
+        let perm = default_babybear_poseidon2_16();
+        let mut native = DuplexChallenger::<F, _, WIDTH, RATE>::new(perm);
+
+        let mut circuit = setup_circuit_with_poseidon2();
+        let mut circuit_challenger =
+            CircuitChallenger::<WIDTH, RATE, Poseidon2Config>::new_babybear();
+
+        for i in 0..RATE + 3 {
+            let t = circuit.define_const(EF::from(F::from_u64(i as u64 + 7)));
+            RecursiveChallenger::<F, EF>::observe(&mut circuit_challenger, &mut circuit, t);
+        }
+        let _ = RecursiveChallenger::<F, EF>::sample(&mut circuit_challenger, &mut circuit);
+
+        RecursiveChallenger::<F, EF>::clear(&mut circuit_challenger, &mut circuit);
+
+        for i in 0..RATE + 2 {
+            let val = F::from_u64(i as u64 + 2000);
+            native.observe(val);
+            let t = circuit.define_const(EF::from(val));
+            RecursiveChallenger::<F, EF>::observe(&mut circuit_challenger, &mut circuit, t);
+        }
+        for _ in 0..3 {
+            let native_sample: F = native.sample();
+            let circuit_sample =
+                RecursiveChallenger::<F, EF>::sample(&mut circuit_challenger, &mut circuit);
+            let expected = circuit.define_const(EF::from(native_sample));
+            circuit.connect(circuit_sample, expected);
+        }
+        let native_ext: EF = native.sample_algebra_element();
+        let circuit_ext =
+            RecursiveChallenger::<F, EF>::sample_ext(&mut circuit_challenger, &mut circuit);
+        let expected_ext = circuit.define_const(native_ext);
+        circuit.connect(circuit_ext, expected_ext);
+
+        let compiled = circuit.build().expect("Circuit should build");
+        compiled
+            .runner()
+            .run()
+            .expect("after clear, the transcript must match a fresh native challenger");
+    }
+
     /// Test multiple consecutive samples without intermediate observations.
     #[test]
     fn test_transcript_consecutive_samples() {
@@ -1629,6 +1681,44 @@ mod goldilocks_d2 {
             .runner()
             .run()
             .expect("Goldilocks D2 ext observe/sample should match native");
+    }
+
+    /// `clear` after duplexing restarts the sponge (capacity included): the post-clear
+    /// transcript matches a fresh native challenger. See the BabyBear D=4 test of the same name.
+    #[test]
+    fn test_goldilocks_d2_clear_after_duplexing_matches_fresh_challenger() {
+        let perm = make_perm();
+        let mut native = DuplexChallenger::<F, _, WIDTH, RATE>::new(perm);
+        let mut circuit = setup_circuit();
+        let mut cc = new_challenger();
+
+        for i in 0..RATE + 1 {
+            let t = circuit.define_const(EF::from(F::from_u64(i as u64 + 5)));
+            RecursiveChallenger::<F, EF>::observe(&mut cc, &mut circuit, t);
+        }
+        let _ = RecursiveChallenger::<F, EF>::sample(&mut cc, &mut circuit);
+
+        RecursiveChallenger::<F, EF>::clear(&mut cc, &mut circuit);
+
+        for i in 0..RATE + 1 {
+            let val = F::from_u64(i as u64 + 3000);
+            native.observe(val);
+            let t = circuit.define_const(EF::from(val));
+            RecursiveChallenger::<F, EF>::observe(&mut cc, &mut circuit, t);
+        }
+        for _ in 0..2 {
+            let ns: F = native.sample();
+            let cs = RecursiveChallenger::<F, EF>::sample(&mut cc, &mut circuit);
+            let exp = circuit.define_const(EF::from(ns));
+            circuit.connect(cs, exp);
+        }
+
+        circuit
+            .build()
+            .expect("circuit should build")
+            .runner()
+            .run()
+            .expect("after clear, the transcript must match a fresh native challenger");
     }
 
     /// `sample_bits` output matches native.

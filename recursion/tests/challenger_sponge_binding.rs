@@ -712,3 +712,65 @@ fn continuation_permutations_read_no_capacity_witness() {
         }
     }
 }
+
+/// `clear` opens a fresh sponge chain: the first permutation after it is a chain start that
+/// reads its whole state (the zero capacity included) over the bus, like the transcript's very
+/// first permutation, and the resulting mid-table chain start proves and verifies. A cleared
+/// challenger that kept its last permutation would instead continue the pre-clear chain and
+/// read no capacity witness.
+#[test]
+fn clear_starts_a_fresh_sponge_chain() {
+    for mode in [RecomposeMode::NpoTable, RecomposeMode::AluChain] {
+        let perm = default_babybear_poseidon2_16();
+        let mut circuit = CircuitBuilder::<EF>::new();
+        circuit.enable_poseidon2_perm::<BabyBearD4Width16, _>(
+            generate_poseidon2_trace::<EF, BabyBearD4Width16>,
+            perm,
+        );
+        match mode {
+            RecomposeMode::NpoTable => {
+                circuit.enable_recompose::<F>(generate_recompose_trace::<F, EF>);
+            }
+            RecomposeMode::AluChain => {
+                circuit.noop_enable_recompose::<F>(generate_recompose_trace::<F, EF>);
+            }
+        }
+
+        let mut challenger = CircuitChallenger::<WIDTH, RATE, Poseidon2Config>::new_babybear();
+        for round in 0..2u64 {
+            for i in 0..RATE {
+                let t = circuit.define_const(EF::from_u64(round * 100 + i as u64 + 1));
+                RecursiveChallenger::<F, EF>::observe(&mut challenger, &mut circuit, t);
+            }
+            for _ in 0..=RATE {
+                let s = RecursiveChallenger::<F, EF>::sample(&mut challenger, &mut circuit);
+                let _ = circuit.mul(s, s);
+            }
+            if round == 0 {
+                RecursiveChallenger::<F, EF>::clear(&mut challenger, &mut circuit);
+            }
+        }
+        let circuit = circuit.build().expect("transcript circuit builds");
+
+        let perms = perm_op_positions(&circuit);
+        assert_eq!(
+            perms.len(),
+            4,
+            "{mode:?}: two permutations before and two after the clear"
+        );
+        for (k, &p) in perms.iter().enumerate() {
+            let (inputs, _) = npo_io(&circuit, p);
+            let chain_start = k % 2 == 0;
+            assert_eq!(
+                (RATE_EXT..WIDTH_EXT).all(|l| !inputs[l].is_empty()),
+                chain_start,
+                "{mode:?}: permutation {k} must {} its capacity over the bus",
+                if chain_start { "read" } else { "not read" }
+            );
+        }
+
+        let traces = run(&circuit);
+        prove_and_verify(&circuit, &traces)
+            .unwrap_or_else(|e| panic!("{mode:?}: honest cleared transcript must verify: {e}"));
+    }
+}

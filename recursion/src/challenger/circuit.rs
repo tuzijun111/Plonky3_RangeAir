@@ -472,5 +472,9 @@ where
         self.output_buffer.clear();
         self.initialized = true;
         self.duplexed_once = false;
+        // The next `D >= 2` permutation must open a fresh sponge chain on the zero state above.
+        // Keeping the pre-clear permutation here would make it a continuation of that
+        // permutation, chaining the old transcript's capacity into the new one.
+        self.last_ext_perm = None;
     }
 }
