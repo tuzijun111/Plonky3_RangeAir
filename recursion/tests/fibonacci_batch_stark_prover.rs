@@ -251,6 +251,136 @@ fn test_fibonacci_batch_verifier() {
         .expect("Failed to verify proof of verification circuit");
 }
 
+/// Regression for upstream e8a29ba: the in-circuit batch-STARK verifier must rebuild the
+/// lookup contexts from the AIRs it reconstructs, not believe the `common.lookups` handed to
+/// it alongside the proof. A right-length/wrong-content lookup set (here: the ALU table's
+/// lookup set emptied) must produce exactly the same verifier circuit as the honest one.
+#[test]
+fn recursive_verifier_ignores_supplied_lookups() {
+    use p3_batch_stark::CommonData;
+    use p3_batch_stark::common::GlobalPreprocessed;
+
+    let n: usize = 20;
+    let mut builder = CircuitBuilder::new();
+    let expected_result = builder.alloc_public_input("expected_result");
+    let mut a = builder.alloc_const(F::ZERO, "F(0)");
+    let mut b = builder.alloc_const(F::ONE, "F(1)");
+    for _i in 2..=n {
+        let next = builder.add(a, b);
+        a = b;
+        b = next;
+    }
+    builder.connect(b, expected_result);
+    let circuit = builder.build().unwrap();
+
+    let table_packing = TablePacking::new(2, 4);
+    let config_proving = make_test_config();
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<MyConfig, _, 1>(
+            &circuit,
+            &table_packing,
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[compute_fibonacci_classical(n)])
+        .unwrap();
+    let traces = runner.run().unwrap();
+    let prover_data = ProverData::from_airs_and_degrees(&config_proving, &airs, &degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let prover = BatchStarkProver::new(config_proving).with_table_packing(table_packing);
+    let batch_stark_proof = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+    prover.verify_all_tables(&batch_stark_proof).unwrap();
+    let honest_common = circuit_prover_data.common_data();
+
+    // Same preprocessed binding and instance count, but the ALU table's lookup set emptied:
+    // the right-length/wrong-content shape that collapses one AIR's lookup argument.
+    let mut lookups = honest_common.lookups.clone();
+    assert!(lookups.len() >= 3 && !lookups[2].is_empty());
+    // Collapse the ALU table's lookup argument (index 2: Const, Public, Alu, ...).
+    lookups[2] = Default::default();
+    let tampered_common = CommonData::<MyConfig>::new(
+        honest_common
+            .preprocessed
+            .as_ref()
+            .map(|g| GlobalPreprocessed {
+                commitment: g.commitment.clone(),
+                instances: g.instances.clone(),
+                matrix_to_instance: g.matrix_to_instance.clone(),
+            }),
+        lookups,
+    );
+
+    let scalars = test_fri_scalars();
+    let fri_verifier_params = FriVerifierParams::with_mmcs(
+        scalars.log_blowup,
+        scalars.log_final_poly_len,
+        scalars.commit_pow_bits,
+        scalars.query_pow_bits,
+        Poseidon2Config::KOALA_BEAR_D4_W16,
+    );
+    let config = make_test_config();
+    let lookup_gadget = LogUpGadget::new();
+
+    let build = |common: &CommonData<MyConfig>| {
+        let mut circuit_builder = CircuitBuilder::new();
+        circuit_builder.enable_poseidon2_perm::<KoalaBearD4Width16, _>(
+            generate_poseidon2_trace::<Challenge, KoalaBearD4Width16>,
+            default_koalabear_poseidon2_16(),
+        );
+        circuit_builder.enable_recompose::<F>(generate_recompose_trace::<F, Challenge>);
+        let mut tp: Vec<Box<dyn TableProver<MyConfig>>> = vec![Box::new(Poseidon2Prover::new(
+            Poseidon2Config::KOALA_BEAR_D4_W16,
+            ConstraintProfile::Standard,
+        ))];
+        tp.extend(recompose_table_provers::<_, 4>(1, false));
+        verify_p3_batch_proof_circuit::<
+            MyConfig,
+            MerkleCapTargets<F, DIGEST_ELEMS>,
+            InputProofTargets<F, Challenge, RecValMmcs<F, DIGEST_ELEMS, MyHash, MyCompress>>,
+            InnerFri,
+            LogUpGadget,
+            _,
+            WIDTH,
+            RATE,
+            1,
+        >(
+            &config,
+            &mut circuit_builder,
+            &batch_stark_proof,
+            &fri_verifier_params,
+            common,
+            &lookup_gadget,
+            Poseidon2Config::KOALA_BEAR_D4_W16,
+            &tp,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        circuit_builder
+            .build()
+            .map_err(|e| format!("{e:?}"))?
+            .generate_preprocessed_columns::<4>()
+            .map_err(|e| format!("{e:?}"))
+    };
+
+    let honest = build(honest_common).expect("honest verifier circuit builds");
+    let tampered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&tampered_common)))
+        .unwrap_or_else(|_| Err("verifier circuit construction panicked".into()));
+    match &tampered {
+        Ok(t) => assert!(
+            *t == honest,
+            "a collapsed lookup set changed the verifier circuit: the verifier believed it"
+        ),
+        Err(e) => panic!("a collapsed lookup set was not ignored by the verifier: {e}"),
+    }
+}
+
 fn compute_fibonacci_classical(n: usize) -> F {
     if n == 0 {
         return F::ZERO;
