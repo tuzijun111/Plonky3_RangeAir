@@ -1479,3 +1479,134 @@ mod forged_constant_value {
         );
     }
 }
+
+// Regression test for the non-canonical full-width `decompose_to_bits` soundness gap
+// (upstream 71449a3 / 9e682ef), in the BabyBear D=4 setting zkSketch uses.
+//
+// `decompose_to_bits::<BF>(x, BF::bits())` only constrained the bits to be boolean and to
+// reconstruct to `x` modulo `p`. For BabyBear `p = 15 * 2^27 + 1 < 2^31`, so every `x <= 2^27 - 2`
+// also decomposes as the 31-bit integer `x + p`, whose low 27 bits read `x + 1`. The hint is
+// honest, so the test swaps the compiled circuit's decomposition hint for one that writes the
+// `x + p` alias (a choice a prover assembling trace polynomials directly is free to make; the
+// preprocessed columns are asserted unchanged), then proves the resulting traces against the
+// HONEST circuit's prover data and verifies. The forged statement is "the low byte of 5 is 6".
+mod non_canonical_bits {
+    extern crate std;
+
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    use p3_circuit::ops::{HintExecutor, Op};
+    use p3_circuit::{CircuitError, WitnessId};
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{BasedVectorSpace, PrimeField64};
+
+    use super::*;
+
+    type EF = BinomialExtensionField<BabyBear, 4>;
+    const D: usize = 4;
+
+    /// Writes the bits of `x + p` (the non-canonical alias) instead of the bits of `x`.
+    #[derive(Debug, Clone)]
+    struct AliasedBits;
+
+    impl HintExecutor<EF> for AliasedBits {
+        fn execute(
+            &self,
+            inputs: &[WitnessId],
+            outputs: &[WitnessId],
+            witness: &mut [Option<EF>],
+        ) -> Result<(), CircuitError> {
+            let x = witness[inputs[0].0 as usize].expect("input set");
+            let x0 = <EF as BasedVectorSpace<BabyBear>>::as_basis_coefficients_slice(&x)[0]
+                .as_canonical_u64();
+            let alias = x0 + BabyBear::ORDER_U64;
+            assert!(alias < (1u64 << outputs.len()), "alias must fit the bit width");
+            for (i, &out) in outputs.iter().enumerate() {
+                witness[out.0 as usize] = Some(EF::from_u64((alias >> i) & 1));
+            }
+            Ok(())
+        }
+
+        fn boxed(&self) -> Box<dyn HintExecutor<EF>> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn full_width_decompose_to_bits_rejects_the_x_plus_p_alias_d4() {
+        let n_bits = <BabyBear as Field>::bits();
+        let mut builder = CircuitBuilder::<EF>::new();
+        let x = builder.public_input();
+        let bits = builder.decompose_to_bits::<BabyBear>(x, n_bits).unwrap();
+        let low = builder
+            .reconstruct_index_from_bits::<BabyBear>(&bits[..8])
+            .unwrap();
+        let low_pub = builder.public_input();
+        builder.connect(low, low_pub);
+        let circuit = builder.build().unwrap();
+
+        let cfg = config::baby_bear();
+        let (ad, pc, npc) = get_airs_and_degrees_with_prep::<BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+        let (airs, degs): (Vec<_>, Vec<usize>) = ad.into_iter().unzip();
+        let honest_data =
+            CircuitProverData::new(ProverData::from_airs_and_degrees(&cfg, &airs, &degs), pc, npc);
+        let prover = BatchStarkProver::new(config::baby_bear());
+
+        // Honest: low byte of 5 is 5.
+        let mut r = circuit.runner();
+        r.set_public_inputs(&[EF::from_u64(5), EF::from_u64(5)]).unwrap();
+        let honest_traces = r.run().unwrap();
+        let hp = prover.prove_all_tables(&honest_traces, &honest_data).unwrap();
+        prover.verify_all_tables(&hp).expect("honest proof must verify");
+
+        // Forged: swap the decomposition hint for the `x + p` alias.
+        let mut forged = circuit.clone();
+        let mut swapped = 0;
+        for op in &mut forged.ops {
+            if let Op::Hint {
+                outputs, executor, ..
+            } = op
+                && outputs.len() == n_bits
+            {
+                *executor = Box::new(AliasedBits);
+                swapped += 1;
+            }
+        }
+        assert_eq!(swapped, 1, "exactly one 31-bit decomposition hint");
+        assert_eq!(
+            circuit.generate_preprocessed_columns::<D>().unwrap(),
+            forged.generate_preprocessed_columns::<D>().unwrap(),
+            "swapping a hint executor must not change the committed preprocessing"
+        );
+
+        let mut fr = forged.runner();
+        fr.set_public_inputs(&[EF::from_u64(5), EF::from_u64(6)]).unwrap();
+        let outcome: Result<(), alloc::string::String> = match fr.run() {
+            Err(e) => Err(alloc::format!("witness generation rejected: {e:?}")),
+            Ok(forged_traces) => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let fp = prover
+                        .prove_all_tables(&forged_traces, &honest_data)
+                        .map_err(|e| alloc::format!("prove: {e:?}"))?;
+                    prover
+                        .verify_all_tables(&fp)
+                        .map_err(|e| alloc::format!("verify: {e:?}"))
+                }))
+                .unwrap_or_else(|_| Err("prover panicked".into()))
+            }
+        };
+        std::println!("non-canonical alias outcome: {outcome:?}");
+        assert!(
+            outcome.is_err(),
+            "a full-width decomposition must not accept the x + p alias (forged low byte 6 of 5)"
+        );
+    }
+}

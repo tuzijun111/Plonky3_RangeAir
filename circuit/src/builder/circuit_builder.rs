@@ -1244,7 +1244,7 @@ where
     ///
     /// # Parameters
     /// - `x`: The field element to decompose.
-    /// - `n_bits`: Number of bits in the decomposition (must be ≤ 64).
+    /// - `n_bits`: Number of bits in the decomposition (must be ≤ `F::bits()`).
     ///
     /// # Returns
     /// A vector of `n_bits` boolean [`ExprId`]s
@@ -1257,7 +1257,7 @@ where
     /// ```
     ///
     /// # Errors
-    /// Returns [`CircuitError::BinaryDecompositionTooManyBits`] if `n_bits > 64`.
+    /// Returns [`CircuitError::BinaryDecompositionTooManyBits`] if `n_bits > F::bits()`.
     ///
     /// # Cost
     /// `n_bits` witness hints + `n_bits` boolean constraints + reconstruction constraints.
@@ -1275,7 +1275,7 @@ where
         // We cannot request more bits than the extension field can represent.
         if n_bits > F::bits() {
             return Err(CircuitBuilderError::BinaryDecompositionTooManyBits {
-                expected: BF::bits(),
+                expected: F::bits(),
                 n_bits,
             });
         }
@@ -1298,8 +1298,65 @@ where
         let reconstructed = self.reconstruct_index_from_bits(&bits)?;
         self.connect(x, reconstructed);
 
+        // Each full-width limb is otherwise non-canonical: for `BF` with modulus `p` in
+        // `(2^{bits-1}, 2^bits)`, a value `x < 2^bits - p` also decomposes as `x + p`
+        // (same field element, different bits). A prover could pick either per limb — e.g.
+        // to shift a Fiat-Shamir query index by one. Pin every full-width limb to its
+        // canonical value (`< p`); a trailing partial limb has fewer than `BF::bits()` bits
+        // so its value is `< 2^{bits-1} < p` and needs no constraint.
+        for chunk in bits.chunks(BF::bits()) {
+            if chunk.len() == BF::bits() {
+                self.assert_bits_canonical::<BF>(chunk);
+            }
+        }
+
         self.pop_scope();
         Ok(bits)
+    }
+
+    /// Assert that little-endian boolean `bits` encode a value strictly less than `BF`'s
+    /// modulus `p` — the unique canonical representative (`value <= p - 1`).
+    ///
+    /// Standard MSB-first `<= (p-1)` comparison: track whether the high prefix still
+    /// equals `p-1` and forbid a bit that would exceed it. For the supported fields
+    /// `p - 1 = [ones][trailing zeros]`, so the trailing-zero run collapses into a single
+    /// constraint (the low bits must all be zero once the high prefix matches). Works for
+    /// any prime field. The caller must have already constrained each bit to be boolean.
+    fn assert_bits_canonical<BF>(&mut self, bits: &[ExprId])
+    where
+        BF: PrimeField64,
+    {
+        let c = BF::ORDER_U64 - 1; // largest canonical value (p - 1)
+        let n = bits.len();
+        let one = self.define_const(F::ONE);
+        let trailing = c.trailing_zeros() as usize;
+
+        // High bits (above the trailing-zero run): keep `eq_prefix = 1` while the prefix
+        // equals `p-1`; a `1` bit where `p-1` has a `0` (with the prefix still equal)
+        // would make the value exceed `p-1`, so it is forbidden.
+        let mut eq_prefix = one;
+        for i in (trailing..n).rev() {
+            let b = bits[i];
+            if (c >> i) & 1 == 1 {
+                eq_prefix = self.mul(eq_prefix, b);
+            } else {
+                let viol = self.mul(b, eq_prefix);
+                self.assert_zero(viol);
+                let nb = self.sub(one, b);
+                eq_prefix = self.mul(eq_prefix, nb);
+            }
+        }
+
+        // Trailing-zero run of `p-1`: if the high prefix equals `p-1` exactly, every low
+        // bit must be zero (so the value is exactly `p-1`). One constraint over their sum.
+        if trailing > 0 {
+            let mut low_sum = bits[0];
+            for &b in &bits[1..trailing] {
+                low_sum = self.add(low_sum, b);
+            }
+            let prod = self.mul(eq_prefix, low_sum);
+            self.assert_zero(prod);
+        }
     }
 
     /// Packs little-endian bits into an extension-field element, limb by limb.
@@ -3107,6 +3164,95 @@ mod proptests {
 
         // Just verify the calculation is correct - reconstruct gives us 5
         assert_eq!(traces.public_trace.values[0], expected_result);
+    }
+
+    #[test]
+    fn assert_bits_canonical_accepts_canonical_rejects_alias() {
+        // The canonical gadget must accept the unique `< p` decomposition and reject the
+        // `x + p` alias (same field value, integer >= p) that a full-width decomposition
+        // would otherwise admit — the freedom that let a prover shift a query index.
+        let n = BabyBear::bits();
+        let run_with = |value: u64| {
+            let mut builder = CircuitBuilder::<BabyBear>::new();
+            let bit_inputs: Vec<_> = (0..n).map(|_| builder.public_input()).collect();
+            for &b in &bit_inputs {
+                builder.assert_bool(b);
+            }
+            builder.assert_bits_canonical::<BabyBear>(&bit_inputs);
+            let circuit = builder.build().expect("build");
+            let mut runner = circuit.runner();
+            let bit_vals: Vec<BabyBear> = (0..n)
+                .map(|i| BabyBear::from_u64((value >> i) & 1))
+                .collect();
+            runner
+                .set_public_inputs(&bit_vals)
+                .expect("set public inputs");
+            runner.run().is_ok()
+        };
+        let p = BabyBear::ORDER_U64;
+        assert!(run_with(5), "canonical value (< p) must be accepted");
+        assert!(
+            !run_with(5 + p),
+            "non-canonical alias (x + p) must be rejected"
+        );
+    }
+
+    #[test]
+    fn decompose_to_bits_full_width_stays_complete() {
+        // A full-width decomposition of a canonical value still succeeds: the honest hint
+        // produces canonical bits, so the added canonical constraint does not reject them.
+        let mut builder = CircuitBuilder::<BabyBear>::new();
+        let value = builder.define_const(BabyBear::from_u64(1_234_567));
+        let _bits = builder
+            .decompose_to_bits::<BabyBear>(value, BabyBear::bits())
+            .unwrap();
+        let circuit = builder.build().expect("build");
+        let runner = circuit.runner();
+        runner
+            .run()
+            .expect("full-width decompose of a canonical value must succeed");
+    }
+
+    #[test]
+    fn decompose_to_bits_multi_limb_rejects_aliased_limb() {
+        // Regression test: a multi-limb decomposition must canonicalize *every* full-width
+        // limb, not just a single-limb (`n_bits == BF::bits()`) decomposition. Mirrors
+        // `decompose_to_bits`'s (fixed) per-chunk canonicity constraints, but — like
+        // `assert_bits_canonical_accepts_canonical_rejects_alias` — feeds the bits as public
+        // inputs instead of via the honest hint, since the hint can never produce a
+        // non-canonical decomposition on its own.
+        type Ext4 = BinomialExtensionField<BabyBear, 4>;
+        let limb_bits = BabyBear::bits();
+        let build_and_run = |limb0: u64, limb1: u64| {
+            let mut builder = CircuitBuilder::<Ext4>::new();
+            let bit_inputs: Vec<_> = (0..2 * limb_bits).map(|_| builder.public_input()).collect();
+            for chunk in bit_inputs.chunks(limb_bits) {
+                builder.assert_bits_canonical::<BabyBear>(chunk);
+            }
+            builder
+                .reconstruct_index_from_bits::<BabyBear>(&bit_inputs)
+                .expect("reconstruct");
+            let circuit = builder.build().expect("build");
+            let mut runner = circuit.runner();
+            let bit_vals: Vec<Ext4> = (0..limb_bits)
+                .map(|i| Ext4::from_u64((limb0 >> i) & 1))
+                .chain((0..limb_bits).map(|i| Ext4::from_u64((limb1 >> i) & 1)))
+                .collect();
+            runner
+                .set_public_inputs(&bit_vals)
+                .expect("set public inputs");
+            runner.run().is_ok()
+        };
+        let p = BabyBear::ORDER_U64;
+        assert!(build_and_run(5, 7), "two canonical limbs must be accepted");
+        assert!(
+            !build_and_run(5, 7 + p),
+            "a non-canonical alias in the second limb must be rejected"
+        );
+        assert!(
+            !build_and_run(5 + p, 7),
+            "a non-canonical alias in the first limb must be rejected"
+        );
     }
 
     #[test]
