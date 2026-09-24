@@ -6,9 +6,19 @@
 //! # Soundness
 //!
 //! All Poseidon2 permutations in the challenger are CTL-verified against the Poseidon2 AIR table.
-//! The circuit builder's `add_poseidon2_perm_for_challenger` / `add_poseidon2_perm_for_challenger_base`
-//! (in `p3_circuit`) delegate to the standard Poseidon2 non-primitive op with full input and rate-output CTL exposure,
-//! and the executor runs the real permutation so the lookup argument enforces correctness.
+//! The circuit builder's `add_poseidon2_perm_for_challenger_chained` /
+//! `add_poseidon2_perm_for_challenger_base` (in `p3_circuit`) delegate to the standard Poseidon2
+//! non-primitive op with rate-input and rate-output CTL exposure, and the executor runs the real
+//! permutation so the lookup argument enforces correctness.
+//!
+//! The capacity is never published on the bus, so it is carried by the AIR: the first
+//! permutation starts a sponge chain whose capacity is CTL-fed from the zero initial state
+//! (constants), and every later permutation continues it (`new_start = false`, capacity slots
+//! left off the bus), so the Poseidon AIR's sponge chain constraint binds its capacity input to
+//! the previous row's capacity output. The builder refuses a circuit in which the previous row
+//! of the table is not the previous duplex step (`SpongeChainNotAdjacent`). (Previously every
+//! `D >= 2` permutation started a fresh chain with CTL-fed capacity read from witnesses no
+//! table created with the previous permutation's capacity output, so it was prover-chosen.)
 //!
 //! Every packing and unpacking the challenger performs goes through the ALU `mul_add` chain
 //! (`recompose_base_coeffs_to_ext_via_alu` / `decompose_ext_to_base_coeffs_via_alu`), never the
@@ -23,7 +33,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_circuit::ops::{Poseidon1Config, Poseidon2Config};
-use p3_circuit::{CircuitBuilder, CircuitBuilderError};
+use p3_circuit::{CircuitBuilder, CircuitBuilderError, NonPrimitiveOpId};
 use p3_field::{ExtensionField, PrimeField64};
 
 use crate::Target;
@@ -62,6 +72,11 @@ pub struct CircuitChallenger<const WIDTH: usize, const RATE: usize, C: Challenge
     /// capacity `None` (zeros enforced by the compact D=1 AIR). Later permutations use
     /// `new_start=false` with the same capacity pattern and chaining.
     duplexed_once: bool,
+
+    /// The `D >= 2` path's previous permutation, if any. Every permutation after the first
+    /// continues the sponge chain from it: its capacity limbs are left off the bus and the
+    /// Poseidon AIR's sponge chain constraint binds them to this row's capacity output.
+    last_ext_perm: Option<NonPrimitiveOpId>,
 }
 
 impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
@@ -81,6 +96,7 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
             output_buffer: Vec::new(),
             initialized: false,
             duplexed_once: false,
+            last_ext_perm: None,
         }
     }
 
@@ -175,6 +191,31 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         self.state = outputs.to_vec();
     }
 
+    /// Pack the sponge state into the extension limbs the next `D >= 2` permutation reads:
+    /// every limb for the chain start, only the rate limbs for a continuation (whose capacity
+    /// is chained in the AIR).
+    fn pack_ext_inputs<BF, EF>(&self, circuit: &mut CircuitBuilder<EF>) -> Vec<Target>
+    where
+        BF: PrimeField64,
+        EF: ExtensionField<BF>,
+    {
+        let num_limbs = if self.last_ext_perm.is_some() {
+            RATE / EF::DIMENSION
+        } else {
+            WIDTH / EF::DIMENSION
+        };
+        (0..num_limbs)
+            .map(|i| {
+                let start = i * EF::DIMENSION;
+                circuit
+                    .recompose_base_coeffs_to_ext_via_alu::<BF>(
+                        &self.state[start..start + EF::DIMENSION],
+                    )
+                    .expect("recomposition should succeed")
+            })
+            .collect()
+    }
+
     fn duplexing_ext<BF, EF>(
         &mut self,
         circuit: &mut CircuitBuilder<EF>,
@@ -183,22 +224,20 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         BF: PrimeField64,
         EF: ExtensionField<BF>,
     {
-        let num_ext_limbs = WIDTH / EF::DIMENSION;
-        let mut ext_inputs = Vec::with_capacity(num_ext_limbs);
-        for i in 0..num_ext_limbs {
-            let start = i * EF::DIMENSION;
-            let end = start + EF::DIMENSION;
-            let ext = circuit
-                .recompose_base_coeffs_to_ext_via_alu::<BF>(&self.state[start..end])
-                .expect("recomposition should succeed");
-            ext_inputs.push(ext);
-        }
-
-        let ext_outputs = circuit
-            .add_poseidon2_perm_for_challenger(poseidon2_config, &ext_inputs)
+        let ext_inputs = self.pack_ext_inputs::<BF, EF>(circuit);
+        let (op_id, rate_outputs) = circuit
+            .add_poseidon2_perm_for_challenger_chained(
+                poseidon2_config,
+                self.last_ext_perm,
+                &ext_inputs,
+            )
             .expect("poseidon2 permutation should succeed");
+        self.last_ext_perm = Some(op_id);
 
-        for (limb, &ext_out) in ext_outputs.iter().enumerate() {
+        // Only the rate limbs are unpacked: the capacity never leaves the permutation table
+        // after the first step (continuations chain it in the AIR), so the capacity entries of
+        // `self.state` keep the zero initial state and are never read again.
+        for (limb, &ext_out) in rate_outputs.iter().enumerate() {
             let coeffs = circuit
                 .decompose_ext_to_base_coeffs_via_alu::<BF>(ext_out)
                 .expect("decomposition should succeed");
@@ -238,22 +277,18 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         BF: PrimeField64,
         EF: ExtensionField<BF>,
     {
-        let num_ext_limbs = WIDTH / EF::DIMENSION;
-        let mut ext_inputs = Vec::with_capacity(num_ext_limbs);
-        for i in 0..num_ext_limbs {
-            let start = i * EF::DIMENSION;
-            let end = start + EF::DIMENSION;
-            let ext = circuit
-                .recompose_base_coeffs_to_ext_via_alu::<BF>(&self.state[start..end])
-                .expect("recomposition should succeed");
-            ext_inputs.push(ext);
-        }
-
-        let ext_outputs = circuit
-            .add_poseidon1_perm_for_challenger(poseidon1_config, &ext_inputs)
+        let ext_inputs = self.pack_ext_inputs::<BF, EF>(circuit);
+        let (op_id, rate_outputs) = circuit
+            .add_poseidon1_perm_for_challenger_chained(
+                poseidon1_config,
+                self.last_ext_perm,
+                &ext_inputs,
+            )
             .expect("poseidon1 permutation should succeed");
+        self.last_ext_perm = Some(op_id);
 
-        for (limb, &ext_out) in ext_outputs.iter().enumerate() {
+        // Only the rate limbs are unpacked; see `duplexing_ext`.
+        for (limb, &ext_out) in rate_outputs.iter().enumerate() {
             let coeffs = circuit
                 .decompose_ext_to_base_coeffs_via_alu::<BF>(ext_out)
                 .expect("decomposition should succeed");

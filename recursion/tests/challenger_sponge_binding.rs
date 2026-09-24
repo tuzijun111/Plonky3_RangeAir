@@ -84,9 +84,11 @@ fn build_transcript_circuit(mode: RecomposeMode) -> Circuit<EF> {
         let t = circuit.define_const(EF::from_u64(i as u64 + 1));
         RecursiveChallenger::<F, EF>::observe(&mut challenger, &mut circuit, t);
     }
-    // `RATE` samples drain the output buffer; the next one forces a second permutation.
+    // `RATE` samples drain the output buffer; the next one forces a second permutation. Each
+    // sample is consumed by an ALU op, as a verifier circuit would consume a challenge.
     for _ in 0..=RATE {
-        let _ = RecursiveChallenger::<F, EF>::sample(&mut challenger, &mut circuit);
+        let s = RecursiveChallenger::<F, EF>::sample(&mut challenger, &mut circuit);
+        let _ = circuit.mul(s, s);
     }
 
     circuit.build().expect("transcript circuit builds")
@@ -324,60 +326,109 @@ fn control_corrupted_const_value_is_rejected() {
 /// The capacity limb the second permutation reads must be the capacity limb the first
 /// permutation produced.
 ///
-/// The edit gives the first permutation an empty output slot for that limb — a slot the
-/// Poseidon2 table neither publishes on the bus nor records in its trace row, so dropping
-/// the write is invisible to the verifier — and replaces the decomposition hint with one
-/// that supplies coefficients of its own.
+/// Two circuit shapes are covered:
+///
+/// - The second permutation reads its capacity limb from a witness (CTL-fed capacity, the
+///   shape before the capacity was chained). The edit gives the first permutation an empty
+///   output slot for that limb — a slot the Poseidon2 table neither publishes on the bus nor
+///   records in its trace row, so dropping the write is invisible to the verifier — and
+///   replaces the decomposition hint with one that supplies coefficients of its own.
+/// - The second permutation reads no capacity witness at all (capacity chained by the AIR).
+///   The edit swaps the second permutation's executor for one that starts a fresh sponge
+///   (zero capacity) instead of continuing the chain — an executor is prover-side code, and
+///   the honest prover data still commits to the continuation row's chain selectors.
 fn capacity_limb_binding(mode: RecomposeMode) {
     let honest = build_transcript_circuit(mode);
     let perms = perm_op_positions(&honest);
     let (_, first_outputs) = npo_io(&honest, perms[0]);
     let (second_inputs, _) = npo_io(&honest, perms[1]);
-    let produced = first_outputs[CAPACITY_LIMB][0];
-    let consumed = second_inputs[CAPACITY_LIMB][0];
 
-    let honest_witness = witness_values(&honest);
-    assert_eq!(
-        honest_witness[produced.0 as usize], honest_witness[consumed.0 as usize],
-        "{mode:?}: the honest witness must carry the capacity limb forward unchanged"
-    );
-
-    let mut edited = honest.clone();
-    let hint_pos = decomposition_hint_position(&honest, produced);
-    match &mut edited.ops[perms[0]] {
-        Op::NonPrimitiveOpWithExecutor { outputs, .. } => {
-            outputs[CAPACITY_LIMB].clear();
+    let edited = if second_inputs[CAPACITY_LIMB].is_empty() {
+        // Chained capacity: splice in a fresh-sponge executor for the second permutation.
+        let mut donor = CircuitBuilder::<EF>::new();
+        donor.enable_poseidon2_perm::<BabyBearD4Width16, _>(
+            generate_poseidon2_trace::<EF, BabyBearD4Width16>,
+            default_babybear_poseidon2_16(),
+        );
+        let limbs: Vec<_> = (0..WIDTH_EXT).map(|_| donor.public_input()).collect();
+        donor
+            .add_poseidon2_perm_for_challenger_chained(CFG, None, &limbs)
+            .expect("donor permutation");
+        let donor = donor.build().expect("donor circuit builds");
+        let donor_exec = donor
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::NonPrimitiveOpWithExecutor { executor, .. }
+                    if format!("{:?}", executor.op_type()).contains("poseidon2_perm") =>
+                {
+                    Some(executor.clone())
+                }
+                _ => None,
+            })
+            .expect("donor permutation op");
+        let mut edited = honest.clone();
+        match &mut edited.ops[perms[1]] {
+            Op::NonPrimitiveOpWithExecutor { executor, .. } => *executor = donor_exec,
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
-    }
-    match &mut edited.ops[hint_pos] {
-        Op::Hint { executor, .. } => *executor = Box::new(ChosenCoefficients(1_000)),
-        _ => unreachable!(),
-    }
-    assert_same_constraint_system(&honest, &edited);
+        edited
+    } else {
+        let produced = first_outputs[CAPACITY_LIMB][0];
+        let consumed = second_inputs[CAPACITY_LIMB][0];
+        let honest_witness = witness_values(&honest);
+        assert_eq!(
+            honest_witness[produced.0 as usize], honest_witness[consumed.0 as usize],
+            "{mode:?}: the honest witness must carry the capacity limb forward unchanged"
+        );
 
-    let edited_witness = witness_values(&edited);
+        let mut edited = honest.clone();
+        let hint_pos = decomposition_hint_position(&honest, produced);
+        match &mut edited.ops[perms[0]] {
+            Op::NonPrimitiveOpWithExecutor { outputs, .. } => {
+                outputs[CAPACITY_LIMB].clear();
+            }
+            _ => unreachable!(),
+        }
+        match &mut edited.ops[hint_pos] {
+            Op::Hint { executor, .. } => *executor = Box::new(ChosenCoefficients(1_000)),
+            _ => unreachable!(),
+        }
+        assert_same_constraint_system(&honest, &edited);
+
+        let edited_witness = witness_values(&edited);
+        assert_ne!(
+            edited_witness[consumed.0 as usize], honest_witness[produced.0 as usize],
+            "{mode:?}: the edit must actually break the capacity chain"
+        );
+        edited
+    };
+
+    // The second permutation's rate output must actually move (it is read downstream).
+    let (_, second_outputs) = npo_io(&honest, perms[1]);
+    let moved = second_outputs[0][0];
     assert_ne!(
-        edited_witness[consumed.0 as usize], honest_witness[produced.0 as usize],
-        "{mode:?}: the edit must actually break the capacity chain"
+        witness_values(&edited)[moved.0 as usize],
+        witness_values(&honest)[moved.0 as usize],
+        "{mode:?}: the edit must change what the second permutation squeezes"
     );
 
     let traces = run(&edited);
+    let outcome = prove_and_verify(&honest, &traces);
+    println!("{mode:?} capacity edit: {outcome:?}");
     assert!(
-        prove_and_verify(&honest, &traces).is_err(),
+        outcome.is_err(),
         "{mode:?}: a proof whose second permutation reads a capacity limb the first \
          permutation never produced must be rejected"
     );
 }
 
 #[test]
-#[ignore = "open soundness gap: challenger capacity limbs are not chained (upstream 367d140 series)"]
 fn capacity_limb_is_bound_across_permutations_alu_chain() {
     capacity_limb_binding(RecomposeMode::AluChain);
 }
 
 #[test]
-#[ignore = "open soundness gap: challenger capacity limbs are not chained (upstream 367d140 series)"]
 fn capacity_limb_is_bound_across_permutations_npo_table() {
     capacity_limb_binding(RecomposeMode::NpoTable);
 }
@@ -598,8 +649,9 @@ fn sampled_ext_challenge_is_bound_npo_table() {
     );
 }
 
-/// Under [`RecomposeMode::AluChain`] the step-`k + 1` packing is deduplicated back onto the
-/// permutation's own output witness.
+/// Under [`RecomposeMode::AluChain`] the step-`k + 1` packing of a rate limb is deduplicated
+/// back onto the permutation's own output witness; a capacity limb is either carried the same
+/// way or (once chained in the AIR) not read from a witness at all.
 #[test]
 fn alu_chain_repacking_reuses_the_permutation_output_witness() {
     let circuit = build_transcript_circuit(RecomposeMode::AluChain);
@@ -607,9 +659,34 @@ fn alu_chain_repacking_reuses_the_permutation_output_witness() {
     let (_, first_outputs) = npo_io(&circuit, perms[0]);
     let (second_inputs, _) = npo_io(&circuit, perms[1]);
     for limb in 0..WIDTH_EXT {
+        if limb >= RATE_EXT && second_inputs[limb].is_empty() {
+            continue;
+        }
         assert_eq!(
             first_outputs[limb][0], second_inputs[limb][0],
             "limb {limb} must be carried on one witness id, not repacked onto a new one"
         );
+    }
+}
+
+/// Every `D >= 2` challenger permutation after the first continues the sponge chain: it reads
+/// no capacity witness, so its capacity can only come from the previous row's output.
+#[test]
+fn continuation_permutations_read_no_capacity_witness() {
+    for mode in [RecomposeMode::NpoTable, RecomposeMode::AluChain] {
+        let circuit = build_transcript_circuit(mode);
+        let perms = perm_op_positions(&circuit);
+        let (first_inputs, _) = npo_io(&circuit, perms[0]);
+        assert!(
+            (0..WIDTH_EXT).all(|l| !first_inputs[l].is_empty()),
+            "{mode:?}: the chain start reads its whole state (zero capacity) over the bus"
+        );
+        for &p in &perms[1..] {
+            let (inputs, _) = npo_io(&circuit, p);
+            assert!(
+                (RATE_EXT..WIDTH_EXT).all(|l| inputs[l].is_empty()),
+                "{mode:?}: a continuation permutation must not read its capacity from a witness"
+            );
+        }
     }
 }

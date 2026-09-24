@@ -86,6 +86,11 @@ pub struct CircuitBuilder<F: Field> {
     /// Routes decomposition reconnect through the ALU `mul_add` chain when set (see
     /// [`Self::decompose_ext_to_base_coeffs_via_alu`]).
     decompose_recompose_via_alu: bool,
+
+    /// `(prev, next)` permutation pairs whose capacity is chained by the permutation AIR's
+    /// sponge chain constraint (see [`Self::add_poseidon2_perm_for_challenger_chained`]).
+    /// `build` checks that `next` is the row right after `prev` in their table.
+    sponge_chain_links: Vec<(NonPrimitiveOpId, NonPrimitiveOpId)>,
 }
 
 impl<F> Default for CircuitBuilder<F>
@@ -119,6 +124,7 @@ where
             ext_select_sources: HashMap::new(),
             recompose_coeff_ctl_for_decompose_links: false,
             decompose_recompose_via_alu: false,
+            sponge_chain_links: Vec::new(),
         }
     }
 
@@ -1168,12 +1174,13 @@ where
     /// Builds the circuit and returns both the circuit and the ExprId→WitnessId mapping for public inputs.
     #[allow(clippy::type_complexity)]
     pub fn build_with_public_mapping(
-        self,
+        mut self,
     ) -> Result<(Circuit<F>, HashMap<ExprId, WitnessId>), CircuitBuilderError> {
         // Stage 1: Lower expressions and non-primitives into a single op list
         for data in &self.non_primitive_ops {
             self.ensure_op_enabled(&data.op_type)?;
         }
+        let sponge_chain_links = core::mem::take(&mut self.sponge_chain_links);
         let lowerer = ExpressionLowerer::new(
             self.expr_builder.graph(),
             &self.non_primitive_ops,
@@ -1195,6 +1202,11 @@ where
 
         // Stage 2: IR transformations and optimizations
         let (ops, rewrite) = Optimizer::optimize(ops);
+
+        // A sponge-chained permutation's capacity is bound by the permutation AIR to the
+        // capacity output of the *previous row of its table*. Refuse a circuit in which that
+        // row is not the permutation the chain was built against.
+        Self::check_sponge_chain_links(&ops, &sponge_chain_links)?;
 
         let resolve = |id: WitnessId| id.resolve(&rewrite);
         let expr_to_widx = expr_to_widx
@@ -1782,6 +1794,137 @@ where
         let coeffs = self.decompose_ext_to_base_coeffs::<BF>(x);
         self.decompose_recompose_via_alu = saved;
         coeffs
+    }
+
+    /// Verify every `(prev, next)` sponge-chain link: `next` must come after `prev` with no other
+    /// op of the same permutation table in between, so the permutation AIR's row-to-row chain
+    /// constraint relates exactly those two permutations.
+    fn check_sponge_chain_links(
+        ops: &[crate::ops::Op<F>],
+        links: &[(NonPrimitiveOpId, NonPrimitiveOpId)],
+    ) -> Result<(), CircuitBuilderError> {
+        if links.is_empty() {
+            return Ok(());
+        }
+        let mut position: HashMap<NonPrimitiveOpId, usize> = HashMap::new();
+        for (i, op) in ops.iter().enumerate() {
+            if let crate::ops::Op::NonPrimitiveOpWithExecutor { op_id, .. } = op {
+                position.insert(*op_id, i);
+            }
+        }
+        let op_type = |i: usize| match &ops[i] {
+            crate::ops::Op::NonPrimitiveOpWithExecutor { executor, .. } => {
+                Some(executor.op_type().clone())
+            }
+            _ => None,
+        };
+        for &(prev, next) in links {
+            let err = CircuitBuilderError::SpongeChainNotAdjacent { prev, next };
+            let (Some(&p), Some(&n)) = (position.get(&prev), position.get(&next)) else {
+                return Err(err);
+            };
+            let ty = op_type(n);
+            if p >= n || op_type(p) != ty || (p + 1..n).any(|i| op_type(i) == ty) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies one duplex step of the circuit challenger's `D >= 2` Poseidon2 permutation,
+    /// chaining the sponge capacity through the permutation AIR.
+    ///
+    /// `inputs` holds the `width_ext` state limbs. Every rate limb is CTL-verified against the
+    /// witness table. With `prev = None` the row starts a fresh sponge chain (`new_start`) and
+    /// the capacity limbs are CTL-verified as well (the challenger feeds its zero initial state
+    /// as constants). With `prev = Some(op)` the capacity limbs of `inputs` are ignored: the row
+    /// continues the chain (`new_start = false`) with capacity slots left off the bus, so the
+    /// Poseidon2 AIR's sponge chain constraint binds them to the capacity output of the
+    /// previous row of the table. `build` refuses the circuit unless that previous row is
+    /// `op` (see [`CircuitBuilderError::SpongeChainNotAdjacent`]).
+    ///
+    /// Before this, every challenger permutation was a fresh chain whose capacity inputs were
+    /// CTL-fed from witnesses no table created with the previous permutation's capacity output
+    /// (only rate outputs are published on the bus), leaving them free.
+    ///
+    /// Returns `(op_id, rate_outputs)` with the `rate_ext` CTL-verified rate output limbs.
+    pub fn add_poseidon2_perm_for_challenger_chained(
+        &mut self,
+        config: crate::ops::Poseidon2Config,
+        prev: Option<NonPrimitiveOpId>,
+        inputs: &[ExprId],
+    ) -> Result<(NonPrimitiveOpId, Vec<ExprId>), CircuitBuilderError> {
+        self.push_scope("poseidon2_perm_for_challenger_chained");
+        let width_ext = config.width_ext();
+        let rate_ext = config.rate_ext();
+        let expected = if prev.is_some() { rate_ext } else { width_ext };
+        if inputs.len() < expected {
+            return Err(CircuitBuilderError::InvalidDimension {
+                expected,
+                actual: inputs.len(),
+            });
+        }
+        let limb_inputs: Vec<Option<ExprId>> = (0..width_ext)
+            .map(|i| (prev.is_none() || i < rate_ext).then(|| inputs[i]))
+            .collect();
+        let (op_id, outputs) = self.add_poseidon2_perm(&Poseidon2PermCall {
+            config,
+            new_start: prev.is_none(),
+            merkle_path: false,
+            mmcs_bit: None,
+            inputs: limb_inputs,
+            out_ctl: vec![true; rate_ext],
+            return_all_outputs: false,
+            mmcs_index_sum: None,
+        })?;
+        if let Some(prev) = prev {
+            self.sponge_chain_links.push((prev, op_id));
+        }
+        let rate_outputs = (0..rate_ext)
+            .map(|i| outputs[i].ok_or(CircuitBuilderError::MissingOutput))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.pop_scope();
+        Ok((op_id, rate_outputs))
+    }
+
+    /// Poseidon1 analogue of [`Self::add_poseidon2_perm_for_challenger_chained`].
+    pub fn add_poseidon1_perm_for_challenger_chained(
+        &mut self,
+        config: crate::ops::Poseidon1Config,
+        prev: Option<NonPrimitiveOpId>,
+        inputs: &[ExprId],
+    ) -> Result<(NonPrimitiveOpId, Vec<ExprId>), CircuitBuilderError> {
+        self.push_scope("poseidon1_perm_for_challenger_chained");
+        let width_ext = config.width_ext();
+        let rate_ext = config.rate_ext();
+        let expected = if prev.is_some() { rate_ext } else { width_ext };
+        if inputs.len() < expected {
+            return Err(CircuitBuilderError::InvalidDimension {
+                expected,
+                actual: inputs.len(),
+            });
+        }
+        let limb_inputs: Vec<Option<ExprId>> = (0..width_ext)
+            .map(|i| (prev.is_none() || i < rate_ext).then(|| inputs[i]))
+            .collect();
+        let (op_id, outputs) = self.add_poseidon1_perm(&Poseidon1PermCall {
+            config,
+            new_start: prev.is_none(),
+            merkle_path: false,
+            mmcs_bit: None,
+            inputs: limb_inputs,
+            out_ctl: vec![true; rate_ext],
+            return_all_outputs: false,
+            mmcs_index_sum: None,
+        })?;
+        if let Some(prev) = prev {
+            self.sponge_chain_links.push((prev, op_id));
+        }
+        let rate_outputs = (0..rate_ext)
+            .map(|i| outputs[i].ok_or(CircuitBuilderError::MissingOutput))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.pop_scope();
+        Ok((op_id, rate_outputs))
     }
 
     /// Applies Poseidon2 permutation for the circuit challenger.

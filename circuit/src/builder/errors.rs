@@ -96,4 +96,15 @@ pub enum CircuitBuilderError {
     /// Invalid dimension: expected a specific number of elements.
     #[error("Invalid dimension: expected {expected}, got {actual}")]
     InvalidDimension { expected: usize, actual: usize },
+
+    /// A sponge-chained permutation is not the row that immediately follows its predecessor
+    /// in their permutation table, so the AIR's chain constraint would bind its capacity to
+    /// the wrong row.
+    #[error(
+        "sponge-chained permutation {next:?} does not immediately follow {prev:?} in its table"
+    )]
+    SpongeChainNotAdjacent {
+        prev: NonPrimitiveOpId,
+        next: NonPrimitiveOpId,
+    },
 }
