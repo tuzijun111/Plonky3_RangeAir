@@ -1281,3 +1281,201 @@ fn test_koalabear_quintic_trinomial_batch_stark_with_poseidon1_d1() {
     assert!(proof.alu_quintic_trinomial);
     prover.verify_all_tables(&proof).unwrap();
 }
+
+// Regression tests for the constant-binding soundness bug (adapted from upstream
+// 01743b9 / bdf7262 / 573f16e to this fork's non-generic `verify_all_tables`, plus a
+// BabyBear D=4 case, the extension setting zkSketch uses).
+//
+// A compile-time constant (`define_const` / `alloc_const`) must be part of the circuit's
+// committed preprocessing. At 19dcb37 `ConstAir`'s preprocessed columns carried only
+// `[multiplicity, witness_idx]`, so a trace generated from a circuit whose constant had been
+// swapped verified against the ORIGINAL circuit's preprocessed commitment.
+mod forged_constant_value {
+    extern crate std;
+
+    use p3_circuit::ops::Op;
+    use p3_field::extension::BinomialExtensionField;
+
+    use super::*;
+
+    /// Proves `traces` against `data` and verifies the result. Evaluates to `Err` when the
+    /// proof is rejected, either by the prover's debug-only `check_constraints` panic or by
+    /// `verify_all_tables`. Any other panic fails the test.
+    macro_rules! prove_then_verify {
+        ($prover:expr, $traces:expr, $data:expr) => {{
+            let (prover, traces, data) = (&$prover, &$traces, &$data);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let proof = prover
+                    .prove_all_tables(traces, data)
+                    .map_err(|e| alloc::format!("prove: {e:?}"))?;
+                assert!(
+                    proof.stark_common.preprocessed.as_ref().map(|p| &p.commitment)
+                        == data.common_data().preprocessed.as_ref().map(|p| &p.commitment),
+                    "the proof must carry the preprocessed commitment of the prover data it used"
+                );
+                prover
+                    .verify_all_tables(&proof)
+                    .map_err(|e| alloc::format!("verify: {e:?}"))
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = payload
+                    .downcast_ref::<alloc::string::String>()
+                    .map(alloc::string::String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("<non-string panic>");
+                assert!(
+                    msg.contains("constraints not satisfied on row"),
+                    "expected the ConstAir constraint-violation panic, got a different panic: {msg}"
+                );
+                Err(alloc::string::String::from(
+                    "prover panicked on the forged constant",
+                ))
+            })
+        }};
+    }
+
+    fn swap_const<F: Field>(
+        circuit: &p3_circuit::Circuit<F>,
+        from: F,
+        to: F,
+    ) -> p3_circuit::Circuit<F> {
+        let mut forged = circuit.clone();
+        let mut changes = 0;
+        for op in &mut forged.ops {
+            if let Op::Const { val, .. } = op
+                && *val == from
+            {
+                *val = to;
+                changes += 1;
+            }
+        }
+        assert_eq!(
+            changes, 1,
+            "exactly one Const op should carry the swapped value"
+        );
+        forged
+    }
+
+    #[test]
+    fn verify_all_tables_rejects_a_forged_constant_value_d1() {
+        let mut builder = CircuitBuilder::<KoalaBear>::new();
+        let c = builder.define_const(KoalaBear::from_u32(42));
+        let x = builder.public_input();
+        builder.connect(c, x);
+        let circuit = builder.build().unwrap();
+
+        let mk = |circ: &p3_circuit::Circuit<KoalaBear>| {
+            let cfg = config::koala_bear();
+            let (ad, pc, npc) = get_airs_and_degrees_with_prep::<KoalaBearConfig, _, 1>(
+                circ,
+                &TablePacking::default(),
+                &[],
+                &[],
+                ConstraintProfile::Standard,
+            )
+            .unwrap();
+            let (airs, degs): (Vec<_>, Vec<usize>) = ad.into_iter().unzip();
+            CircuitProverData::new(
+                ProverData::from_airs_and_degrees(&cfg, &airs, &degs),
+                pc,
+                npc,
+            )
+        };
+        let honest_data = mk(&circuit);
+        let prover = BatchStarkProver::new(config::koala_bear());
+
+        let mut r = circuit.runner();
+        r.set_public_inputs(&[KoalaBear::from_u32(42)]).unwrap();
+        let honest_traces = r.run().unwrap();
+        prove_then_verify!(prover, honest_traces, honest_data)
+            .expect("honest proof must verify");
+
+        let forged = swap_const(&circuit, KoalaBear::from_u32(42), KoalaBear::from_u32(43));
+        assert_ne!(
+            circuit.generate_preprocessed_columns::<1>().unwrap(),
+            forged.generate_preprocessed_columns::<1>().unwrap(),
+            "circuits differing only in a constant's value must have different preprocessing"
+        );
+        let forged_data = mk(&forged);
+        assert!(
+            honest_data.common_data().preprocessed.as_ref().unwrap().commitment
+                != forged_data.common_data().preprocessed.as_ref().unwrap().commitment,
+            "circuits differing only in a constant's value must commit to different \
+             preprocessed data"
+        );
+
+        let mut fr = forged.runner();
+        fr.set_public_inputs(&[KoalaBear::from_u32(43)]).unwrap();
+        let forged_traces = fr.run().unwrap();
+        // The exploit: prove the forged trace against the ORIGINAL circuit's prover data, so
+        // the proof carries the honest preprocessed commitment (VK).
+        let res = prove_then_verify!(prover, forged_traces, honest_data);
+        std::println!("forged D1 constant: {res:?}");
+        assert!(
+            res.is_err(),
+            "a trace asserting the wrong value for a compile-time constant must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_all_tables_rejects_a_forged_constant_value_d4() {
+        type EF = BinomialExtensionField<BabyBear, 4>;
+        const D: usize = 4;
+        let val = EF::from_basis_coefficients_fn(|i| BabyBear::from_u32(10 + i as u32));
+        let forged_val = EF::from_basis_coefficients_fn(|i| BabyBear::from_u32(20 + i as u32));
+
+        let mut builder = CircuitBuilder::<EF>::new();
+        let c = builder.define_const(val);
+        let x = builder.public_input();
+        let y = builder.mul(c, x);
+        let out = builder.public_input();
+        builder.connect(y, out);
+        let circuit = builder.build().unwrap();
+
+        let mk = |circ: &p3_circuit::Circuit<EF>| {
+            let cfg = config::baby_bear();
+            let (ad, pc, npc) = get_airs_and_degrees_with_prep::<BabyBearConfig, _, D>(
+                circ,
+                &TablePacking::default(),
+                &[],
+                &[],
+                ConstraintProfile::Standard,
+            )
+            .unwrap();
+            let (airs, degs): (Vec<_>, Vec<usize>) = ad.into_iter().unzip();
+            CircuitProverData::new(
+                ProverData::from_airs_and_degrees(&cfg, &airs, &degs),
+                pc,
+                npc,
+            )
+        };
+        let honest_data = mk(&circuit);
+        let prover = BatchStarkProver::new(config::baby_bear());
+        let xin = EF::from_basis_coefficients_fn(|i| BabyBear::from_u32(3 + i as u32));
+
+        let mut r = circuit.runner();
+        r.set_public_inputs(&[xin, val * xin]).unwrap();
+        let honest_traces = r.run().unwrap();
+        prove_then_verify!(prover, honest_traces, honest_data)
+            .expect("honest D4 proof must verify");
+
+        let forged = swap_const(&circuit, val, forged_val);
+        let forged_data = mk(&forged);
+        assert!(
+            honest_data.common_data().preprocessed.as_ref().unwrap().commitment
+                != forged_data.common_data().preprocessed.as_ref().unwrap().commitment,
+            "D4: circuits differing only in a constant's value must commit to different \
+             preprocessed data"
+        );
+
+        let mut fr = forged.runner();
+        fr.set_public_inputs(&[xin, forged_val * xin]).unwrap();
+        let forged_traces = fr.run().unwrap();
+        let res = prove_then_verify!(prover, forged_traces, honest_data);
+        std::println!("forged D4 constant: {res:?}");
+        assert!(
+            res.is_err(),
+            "D4: a trace asserting the wrong value for a compile-time constant must be rejected"
+        );
+    }
+}
