@@ -82,6 +82,10 @@ pub struct CircuitBuilder<F: Field> {
     /// Routes decomposition reconnect through `recompose/coeff` when set (see
     /// [`Self::set_recompose_coeff_ctl_for_decompose_links`]).
     recompose_coeff_ctl_for_decompose_links: bool,
+
+    /// Routes decomposition reconnect through the ALU `mul_add` chain when set (see
+    /// [`Self::decompose_ext_to_base_coeffs_via_alu`]).
+    decompose_recompose_via_alu: bool,
 }
 
 impl<F> Default for CircuitBuilder<F>
@@ -114,6 +118,7 @@ where
             ext_recompose_coeffs: HashMap::new(),
             ext_select_sources: HashMap::new(),
             recompose_coeff_ctl_for_decompose_links: false,
+            decompose_recompose_via_alu: false,
         }
     }
 
@@ -1687,9 +1692,12 @@ where
                 // Non-cached branches are decomposed WITHOUT the coeff-ctl flag: their
                 // witnesses are not placed directly into Poseidon2 rate slots — only the
                 // select results are. We create a ctl entry for x itself below (if needed),
-                // so the WitnessChecks bus stays balanced.
+                // so the WitnessChecks bus stays balanced. They reconstruct through the ALU
+                // chain instead, which is what ties each of those hinted coefficients to the
+                // branch value it was decomposed from before the selects read them.
                 let saved_ctl = self.recompose_coeff_ctl_for_decompose_links;
                 self.recompose_coeff_ctl_for_decompose_links = false;
+                let saved_alu = core::mem::replace(&mut self.decompose_recompose_via_alu, true);
                 let t_coeffs = match t_coeffs_opt {
                     Some(c) => c,
                     None => self.decompose_ext_to_base_coeffs::<BF>(t)?,
@@ -1698,6 +1706,7 @@ where
                     Some(c) => c,
                     None => self.decompose_ext_to_base_coeffs::<BF>(s)?,
                 };
+                self.decompose_recompose_via_alu = saved_alu;
                 self.recompose_coeff_ctl_for_decompose_links = saved_ctl;
                 debug_assert_eq!(t_coeffs.len(), F::DIMENSION);
                 debug_assert_eq!(s_coeffs.len(), F::DIMENSION);
@@ -1736,7 +1745,9 @@ where
             .ok_or(CircuitBuilderError::MissingOutput)?;
 
         // Constrain: sum(coeffs[i] * basis[i]) == x
-        let reconstructed = if self.recompose_coeff_ctl_for_decompose_links {
+        let reconstructed = if self.decompose_recompose_via_alu {
+            self.recompose_base_coeffs_to_ext_via_alu::<BF>(&coeffs)?
+        } else if self.recompose_coeff_ctl_for_decompose_links {
             self.recompose_base_coeffs_to_ext_with_coeff_lookups::<BF>(&coeffs)?
         } else {
             self.recompose_base_coeffs_to_ext::<BF>(&coeffs)?
@@ -1745,6 +1756,32 @@ where
 
         self.pop_scope();
         Ok(coeffs)
+    }
+
+    /// Like [`Self::decompose_ext_to_base_coeffs`], but reconstructs through the ALU `mul_add`
+    /// chain even when the recompose NPO table is enabled.
+    ///
+    /// The recompose table's row carries the D coefficient values in free main-trace columns and
+    /// publishes only `[output_idx, v_0, .., v_{D-1}]`, so it pins those columns to `x` without
+    /// tying them to the hinted coefficient witnesses this call returns. Callers that need the
+    /// returned targets to *be* the coefficients of `x` — anything that feeds them back into a
+    /// hash, a repacking, or a transcript — must use this form, whose `mul_add` chain reads each
+    /// coefficient as a bus-bound operand and constrains their weighted sum to `x`.
+    ///
+    /// # Cost
+    /// D witness hints + D `mul_add` rows, in place of the single recompose row.
+    pub fn decompose_ext_to_base_coeffs_via_alu<BF>(
+        &mut self,
+        x: ExprId,
+    ) -> Result<Vec<ExprId>, CircuitBuilderError>
+    where
+        BF: PrimeField64,
+        F: ExtensionField<BF>,
+    {
+        let saved = core::mem::replace(&mut self.decompose_recompose_via_alu, true);
+        let coeffs = self.decompose_ext_to_base_coeffs::<BF>(x);
+        self.decompose_recompose_via_alu = saved;
+        coeffs
     }
 
     /// Applies Poseidon2 permutation for the circuit challenger.
