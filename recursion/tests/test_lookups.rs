@@ -976,6 +976,68 @@ fn test_range_recursion() {
     let _traces = runner.run().unwrap();
 }
 
+/// Rebuilding the recursive verifier circuit for the SAME proof must yield the same op list
+/// (hence the same preprocessed trace and verification key). The range proof carries at least
+/// two global buses; the per-bus global cumulative-sum checks used to be emitted in `HashMap`
+/// iteration order, which is randomly seeded per map, so about half of all rebuilds ordered
+/// those ops differently.
+#[test]
+fn test_verifier_circuit_build_is_deterministic() {
+    let TestCircuitProofData {
+        mut batch_stark_proof,
+        circuit_prover_data,
+        lookup_gadget,
+        config,
+        params,
+        pis,
+        ..
+    } = get_test_range_circuit_proof();
+    let common = circuit_prover_data.common_data();
+
+    let mut bus_names: Vec<&str> = batch_stark_proof
+        .proof
+        .global_lookup_data
+        .iter()
+        .flatten()
+        .map(|d| d.name.as_str())
+        .collect();
+    bus_names.sort_unstable();
+    bus_names.dedup();
+    assert!(
+        bus_names.len() >= 2,
+        "the fixture must carry at least two global buses, got {bus_names:?}"
+    );
+
+    let mut build = || {
+        let mut circuit_builder = setup_circuit_builder();
+        let (verifier_inputs, _) = get_verifier_inputs_and_challenges(
+            &mut circuit_builder,
+            &config,
+            &params,
+            &mut batch_stark_proof,
+            common,
+            &pis,
+            None,
+            &lookup_gadget,
+        );
+        verifier_inputs.expect("verifier inputs");
+        circuit_builder.build().unwrap()
+    };
+
+    let base = build();
+    // With two buses each rebuild picks one of two orders under the old code, so 16
+    // rebuilds all matching `base` by chance has probability 2^-16.
+    for trial in 0..16 {
+        let c = build();
+        assert_eq!(c.ops.len(), base.ops.len(), "trial {trial}: op count differs");
+        let first_diff = base.ops.iter().zip(c.ops.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff, None,
+            "trial {trial}: verifier circuit rebuilt from the same proof has a different op order"
+        );
+    }
+}
+
 /// Test Poseidon2 with input/output CTL lookups enabled.
 /// This is a minimal test to verify that CTL lookups work correctly
 /// with Poseidon2 operations, similar to how MMCS uses them.

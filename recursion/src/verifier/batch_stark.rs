@@ -1097,15 +1097,24 @@ where
         circuit.connect(folded_mul, quotient);
 
         // Check that the global lookup cumulative values accumulate to the expected value.
-        let mut global_cumulative = HashMap::<&String, Vec<_>>::new();
+        //
+        // One check per global bus, emitted in the order each bus name first
+        // appears in `global_lookup_data`. (Iterating a `HashMap` here emitted
+        // them in the map's randomly seeded order, so two builds of the same
+        // verifier circuit could order these ops differently whenever the
+        // proof has two or more global buses — changing the circuit's
+        // preprocessed trace, hence its verification key, between builds.)
+        let mut bus_index = HashMap::<&String, usize>::new();
+        let mut global_cumulative: Vec<Vec<_>> = Vec::new();
         for data in global_lookup_data.iter().flatten() {
-            global_cumulative
-                .entry(&data.name)
-                .or_default()
-                .push(data.cumulative_sum);
+            let idx = *bus_index.entry(&data.name).or_insert_with(|| {
+                global_cumulative.push(Vec::new());
+                global_cumulative.len() - 1
+            });
+            global_cumulative[idx].push(data.cumulative_sum);
         }
 
-        for all_expected_cumulative in global_cumulative.values() {
+        for all_expected_cumulative in &global_cumulative {
             lookup_gadget.verify_global_final_value_circuit(circuit, all_expected_cumulative);
         }
     }
