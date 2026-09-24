@@ -1669,3 +1669,75 @@ mod non_canonical_bits {
         );
     }
 }
+
+// Regression for upstream 63db18d (ported as `verify_all_tables_for_field`): the native verifier
+// must check the proof against the verifier's own trace field, not the field metadata the proof
+// declares. `verify_all_tables` reads `ext_degree` / `w_binomial` from the proof, and neither is
+// bound by the preprocessed commitment, so a proof could pick the extension relation (e.g. a
+// different `W` in `x^4 = W`) its ALU rows are checked against.
+mod trace_field_binding {
+    use p3_field::extension::BinomialExtensionField;
+
+    use super::*;
+
+    type EF4 = BinomialExtensionField<BabyBear, 4>;
+
+    fn d4_proof() -> (BatchStarkProver<BabyBearConfig>, BatchStarkProof<BabyBearConfig>) {
+        let mut builder = CircuitBuilder::<EF4>::new();
+        let x = builder.public_input();
+        let y = builder.public_input();
+        let z = builder.mul(x, y);
+        let out = builder.public_input();
+        builder.connect(z, out);
+        let circuit = builder.build().unwrap();
+        let cfg = config::baby_bear();
+        let (ad, pc, npc) = get_airs_and_degrees_with_prep::<BabyBearConfig, _, 4>(
+            &circuit,
+            &TablePacking::default(),
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+        let (airs, degs): (Vec<_>, Vec<usize>) = ad.into_iter().unzip();
+        let data = CircuitProverData::new(ProverData::from_airs_and_degrees(&cfg, &airs, &degs), pc, npc);
+        let xv = EF4::from_basis_coefficients_fn(|i| BabyBear::from_u32(3 + i as u32));
+        let yv = EF4::from_basis_coefficients_fn(|i| BabyBear::from_u32(7 + i as u32));
+        let mut r = circuit.runner();
+        r.set_public_inputs(&[xv, yv, xv * yv]).unwrap();
+        let traces = r.run().unwrap();
+        let prover = BatchStarkProver::new(config::baby_bear());
+        let proof = prover.prove_all_tables(&traces, &data).unwrap();
+        (prover, proof)
+    }
+
+    #[test]
+    fn verify_for_field_accepts_the_honest_field() {
+        let (prover, proof) = d4_proof();
+        prover.verify_all_tables_for_field::<EF4>(&proof).unwrap();
+    }
+
+    #[test]
+    fn verify_for_field_rejects_a_proof_declaring_another_w() {
+        let (prover, mut proof) = d4_proof();
+        proof.w_binomial = proof.w_binomial.map(|w| w + BabyBear::ONE);
+        assert!(matches!(
+            prover.verify_all_tables_for_field::<EF4>(&proof),
+            Err(BatchStarkProverError::InvalidMetadata(ProofMetadataError::BinomialWMismatch))
+        ));
+    }
+
+    #[test]
+    fn verify_for_field_rejects_a_proof_declaring_another_degree() {
+        let (prover, proof) = d4_proof();
+        assert!(matches!(
+            prover.verify_all_tables_for_field::<BabyBear>(&proof),
+            Err(BatchStarkProverError::InvalidMetadata(
+                ProofMetadataError::ExtDegreeMismatch {
+                    expected: 1,
+                    got: 4
+                }
+            ))
+        ));
+    }
+}

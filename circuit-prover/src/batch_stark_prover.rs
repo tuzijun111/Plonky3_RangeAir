@@ -572,6 +572,22 @@ pub enum ProofMetadataError {
     /// `ext_degree` is not one of the supported values.
     #[error("unsupported extension degree {0} (supported: 1,2,4,5,6,8)")]
     UnsupportedExtDegree(usize),
+
+    /// The proof's declared extension degree does not match the verifier's expected trace field.
+    #[error(
+        "proof ext_degree {got} does not match the verifier's expected trace field (degree {expected})"
+    )]
+    ExtDegreeMismatch { expected: usize, got: usize },
+
+    /// The proof's binomial parameter `W` does not match the verifier's expected trace field.
+    #[error("proof binomial W does not match the verifier's expected trace field")]
+    BinomialWMismatch,
+
+    /// The proof's quintic-trinomial reduction flag does not match the verifier's expected trace field.
+    #[error(
+        "proof quintic-trinomial flag {got} does not match the verifier's expected trace field ({expected})"
+    )]
+    QuinticReductionMismatch { expected: bool, got: bool },
 }
 
 /// Errors for the batch STARK table prover.
@@ -1018,7 +1034,68 @@ where
         }
     }
 
+    /// Verify the unified batch STARK proof against all tables, with the verifier's **expected
+    /// trace element field** `EF` (port of upstream 63db18d, under a new name so existing
+    /// `verify_all_tables` callers keep compiling).
+    ///
+    /// `EF`'s degree and binomial/quintic reduction parameters are derived verifier-side and
+    /// bound against the proof's declared `ext_degree` / `w_binomial` /
+    /// `alu_quintic_trinomial` before any AIR is reconstructed, so the verified
+    /// extension-arithmetic relation is verifier-chosen rather than proof-chosen. Prefer this
+    /// over [`Self::verify_all_tables`] whenever the proof comes from an untrusted prover.
+    pub fn verify_all_tables_for_field<EF>(
+        &self,
+        proof: &BatchStarkProof<SC>,
+    ) -> Result<(), BatchStarkProverError>
+    where
+        EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
+    {
+        proof.validate()?;
+
+        // Reduction parameters as the prover would store them for this field (see `prove`).
+        let expected_w = if EF::DIMENSION > 1 {
+            EF::extract_w()
+        } else {
+            None
+        };
+        let expected_quintic = EF::DIMENSION == 5 && EF::alu_is_quintic_trinomial();
+
+        if proof.ext_degree != EF::DIMENSION {
+            return Err(ProofMetadataError::ExtDegreeMismatch {
+                expected: EF::DIMENSION,
+                got: proof.ext_degree,
+            }
+            .into());
+        }
+        if proof.w_binomial != expected_w {
+            return Err(ProofMetadataError::BinomialWMismatch.into());
+        }
+        if proof.alu_quintic_trinomial != expected_quintic {
+            return Err(ProofMetadataError::QuinticReductionMismatch {
+                expected: expected_quintic,
+                got: proof.alu_quintic_trinomial,
+            }
+            .into());
+        }
+
+        let common = &proof.stark_common;
+        match EF::DIMENSION {
+            1 => self.verify::<1>(proof, None, common),
+            2 => self.verify::<2>(proof, expected_w, common),
+            4 => self.verify::<4>(proof, expected_w, common),
+            5 => self.verify::<5>(proof, expected_w, common),
+            6 => self.verify::<6>(proof, expected_w, common),
+            8 => self.verify::<8>(proof, expected_w, common),
+            d => Err(BatchStarkProverError::UnsupportedDegree(d)),
+        }
+    }
+
     /// Verify the unified batch STARK proof against all tables.
+    ///
+    /// **Trusts the proof's own field metadata**: the trace extension degree, the binomial `W`
+    /// and the quintic-trinomial flag are read from the proof, and none of them is bound by the
+    /// preprocessed commitment, so a proof chooses the extension-arithmetic relation it is
+    /// checked against. Use [`Self::verify_all_tables_for_field`] for untrusted proofs.
     pub fn verify_all_tables(
         &self,
         proof: &BatchStarkProof<SC>,
