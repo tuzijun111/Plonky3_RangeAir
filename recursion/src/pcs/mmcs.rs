@@ -30,21 +30,47 @@ use crate::Target;
 /// - `permutation_config`: Poseidon2 configuration
 /// - `base_coeffs`: Base field coefficient targets (in lifted representation)
 /// - `reset`: If true, starts a new hash chain (initial state = zeros)
-/// - `alu_recompose`: when `true`, base coefficients are recomposed into extension elements
-///   via the ALU `mul_add` chain instead of the recompose NPO table, and a partial chunk's
-///   carry-over coefficients are unpacked the same way. The ALU chain reads every coefficient as
-///   a bus-bound `mul_add` operand, so each packed limb the sponge absorbs stays tied to its
-///   coefficient witnesses and each carried-over coefficient stays tied to the previous
-///   permutation output it was unpacked from. The NPO table publishes only its own output on the
-///   WitnessChecks bus and leaves the packed limb as free main-trace columns, so coefficients
-///   whose only consumer is this hash (opened leaf values, hiding-MMCS salt private inputs) end
-///   up with no bus creator. The recomposed value is identical either way.
+/// - `packing`: how base coefficients are recomposed into the extension limbs the sponge absorbs
+///   (and how a partial chunk's carry-over coefficients are unpacked). Never the plain recompose
+///   table, which publishes only its packed output on the WitnessChecks bus and leaves the limb
+///   as free main-trace columns. [`BaseCoeffPacking::Alu`] reads every coefficient as a
+///   bus-bound `mul_add` operand but ties only `sum(c_i * basis_i)`, so each coefficient keeps
+///   `D - 1` free base dimensions; [`BaseCoeffPacking::CoeffBound`] goes through the
+///   `recompose/coeff` table, which publishes each coefficient as `[idx, v_i, 0, .., 0]` next to
+///   the limb, so an opened leaf value must be the base-field element the leaf commits to.
+///   (Port of upstream 309f43e / abc8f2f / 98b835f.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaseCoeffPacking {
+    Alu,
+    CoeffBound,
+}
+
+/// Whether `verify_batch_circuit`'s leaf hash packs through `recompose/coeff` (upstream 98b835f):
+/// the non-hiding binary BabyBear/KoalaBear D4 width-16 Poseidon2 geometry. Other geometries and
+/// hiding (salted) leaves keep the ALU chain.
+fn use_coeff_bound_binary_base_opening<F, EF>(
+    permutation_config: PermConfig,
+    salts: Option<&[Vec<Target>]>,
+) -> bool
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    <EF as BasedVectorSpace<F>>::DIMENSION == 4
+        && salts.is_none()
+        && permutation_config.as_poseidon2().is_some_and(|config| {
+            config.d() == 4
+                && config.width() == 16
+                && (config.is_baby_bear() || config.is_koala_bear())
+        })
+}
+
 fn add_hash_base_coeffs_overwrite<F, EF>(
     circuit: &mut CircuitBuilder<EF>,
     permutation_config: &PermConfig,
     base_coeffs: &[Target],
     reset: bool,
-    alu_recompose: bool,
+    packing: BaseCoeffPacking,
 ) -> Result<Vec<Target>, CircuitBuilderError>
 where
     F: Field + PrimeField64,
@@ -97,21 +123,23 @@ where
                     // Full extension element - just recompose our values
                     let ext_coeffs: Vec<_> =
                         (0..ext_degree).map(|i| chunk[base_start + i]).collect();
-                    inputs[ext_idx] = Some(if alu_recompose {
+                    inputs[ext_idx] = Some(if packing == BaseCoeffPacking::Alu {
                         circuit.recompose_base_coeffs_to_ext_via_alu::<F>(&ext_coeffs)?
                     } else {
-                        circuit.recompose_base_coeffs_to_ext::<F>(&ext_coeffs)?
+                        circuit.recompose_base_coeffs_to_ext_with_coeff_lookups::<F>(&ext_coeffs)?
                     });
                 } else {
                     // Partial extension element - mix with previous output (overwrite mode)
                     // This is the key fix: unused positions keep previous permutation output
                     let prev_coeffs: Option<Vec<Target>> = if !is_first {
                         if let Some(ref prev_rate) = last_rate_outputs {
-                            Some(if alu_recompose {
+                            Some(if packing == BaseCoeffPacking::Alu {
                                 circuit
                                     .decompose_ext_to_base_coeffs_via_alu::<F>(prev_rate[ext_idx])?
                             } else {
-                                circuit.decompose_ext_to_base_coeffs::<F>(prev_rate[ext_idx])?
+                                circuit.decompose_ext_to_base_coeffs_with_coeff_lookups::<F>(
+                                    prev_rate[ext_idx],
+                                )?
                             })
                         } else {
                             None
@@ -134,10 +162,10 @@ where
                         }
                     }
 
-                    inputs[ext_idx] = Some(if alu_recompose {
+                    inputs[ext_idx] = Some(if packing == BaseCoeffPacking::Alu {
                         circuit.recompose_base_coeffs_to_ext_via_alu::<F>(&ext_coeffs)?
                     } else {
-                        circuit.recompose_base_coeffs_to_ext::<F>(&ext_coeffs)?
+                        circuit.recompose_base_coeffs_to_ext_with_coeff_lookups::<F>(&ext_coeffs)?
                     });
                 }
             }
@@ -214,7 +242,7 @@ where
             permutation_config,
             &base_coeffs,
             reset,
-            true,
+            BaseCoeffPacking::Alu,
         );
     }
 
@@ -392,15 +420,21 @@ where
             continue;
         }
 
-        // Hash using overwrite-mode sponge (matching native PaddingFreeSponge). The
-        // coefficients (opened values and any salt private inputs) are recomposed via ALU so
-        // they appear as ALU operands on the WitnessChecks bus.
+        // Hash using overwrite-mode sponge (matching native PaddingFreeSponge). Non-hiding binary
+        // D4/W16 Poseidon2 leaves use coefficient-bound recomposition (fails closed with
+        // `RecomposeCoeffLookupsUnavailable` without `enable_recompose`); salted and all other
+        // geometries keep the ALU chain.
+        let packing = if use_coeff_bound_binary_base_opening::<F, EF>(permutation_config, salts) {
+            BaseCoeffPacking::CoeffBound
+        } else {
+            BaseCoeffPacking::Alu
+        };
         *digest = add_hash_base_coeffs_overwrite::<F, EF>(
             circuit,
             &permutation_config,
             &all_base_coeffs,
             true,
-            true,
+            packing,
         )?;
     }
 
@@ -503,7 +537,7 @@ where
                 &permutation_config,
                 &all_base,
                 true,
-                true,
+                BaseCoeffPacking::Alu,
             )?
         } else {
             let all_ext: Vec<Target> = mats_at_height

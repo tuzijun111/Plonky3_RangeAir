@@ -119,7 +119,10 @@ fn permutation_input_witnesses(circuit: &Circuit<EF>) -> Vec<WitnessId> {
         .collect()
 }
 
+/// Superseded: after the 98b835f port the eligible (BabyBear D4 W16, non-hiding) leaf hash
+/// packs through `recompose/coeff`, not the ALU chain; see the `recompose_coeff` tests below.
 #[test]
+#[ignore = "superseded by recompose/coeff leaf packing (upstream 98b835f port)"]
 fn leaf_hash_limbs_are_packed_by_the_alu_chain() {
     let circuit = build_leaf_hash_circuit();
 
@@ -150,7 +153,10 @@ fn leaf_hash_limbs_are_packed_by_the_alu_chain() {
     );
 }
 
+/// Superseded like [`leaf_hash_limbs_are_packed_by_the_alu_chain`]; the `recompose/coeff`
+/// analogue is `re_pointing_a_coeff_bound_leaf_packing_is_visible_to_the_verifier`.
 #[test]
+#[ignore = "superseded by recompose/coeff leaf packing (upstream 98b835f port)"]
 fn re_pointing_a_leaf_hash_packing_is_visible_to_the_verifier() {
     let honest = build_leaf_hash_circuit();
 
@@ -192,4 +198,106 @@ fn re_pointing_a_leaf_hash_packing_is_visible_to_the_verifier() {
         "re-pointing the packing that feeds the leaf hash must change the constraint system \
          the verifier derives, not just prover-side data"
     );
+}
+
+fn is_plain_recompose(op: &Op<EF>) -> bool {
+    match op {
+        Op::NonPrimitiveOpWithExecutor { executor, .. } => {
+            format!("{:?}", executor.op_type()) == "NpoTypeId(recompose)"
+        }
+        _ => false,
+    }
+}
+
+fn is_coeff_recompose(op: &Op<EF>) -> bool {
+    match op {
+        Op::NonPrimitiveOpWithExecutor { executor, .. } => {
+            format!("{:?}", executor.op_type()) == "NpoTypeId(recompose/coeff)"
+        }
+        _ => false,
+    }
+}
+
+/// Upstream 98b835f: the eligible leaf hash packs each limb through `recompose/coeff`, which
+/// publishes every coefficient as a base-field element next to the limb, so an opened value
+/// cannot trade a base coefficient for a non-base component of its neighbour.
+#[test]
+fn leaf_hash_limbs_are_packed_through_recompose_coeff() {
+    let circuit = build_leaf_hash_circuit();
+    let mut coeff_packed = 0;
+    for wid in permutation_input_witnesses(&circuit) {
+        let writer = &circuit.ops[writer_position(&circuit, wid)];
+        assert!(
+            !is_plain_recompose(writer),
+            "a permutation reads {wid:?}, whose writer is a plain recompose row"
+        );
+        assert!(
+            !matches!(writer, Op::Alu { .. }),
+            "a permutation reads {wid:?}, packed by the ALU chain (D - 1 free dims per coefficient)"
+        );
+        coeff_packed += usize::from(is_coeff_recompose(writer));
+    }
+    assert!(
+        coeff_packed > 0,
+        "the leaf's opened coefficients must reach the sponge through recompose/coeff"
+    );
+}
+
+/// The `recompose/coeff` row advertises its coefficients' witness indices in the preprocessed
+/// columns, so re-pointing it at other coefficients is visible to the verifier.
+#[test]
+fn re_pointing_a_coeff_bound_leaf_packing_is_visible_to_the_verifier() {
+    let honest = build_leaf_hash_circuit();
+    let packed = permutation_input_witnesses(&honest)
+        .into_iter()
+        .find(|&wid| is_coeff_recompose(&honest.ops[writer_position(&honest, wid)]))
+        .expect("a recompose/coeff-packed permutation input");
+    let pos = writer_position(&honest, packed);
+    let mut edited = honest.clone();
+    match &mut edited.ops[pos] {
+        Op::NonPrimitiveOpWithExecutor { inputs, .. } => inputs[0].swap(0, 1),
+        _ => unreachable!(),
+    }
+    assert!(
+        honest.generate_preprocessed_columns::<D>().unwrap()
+            != edited.generate_preprocessed_columns::<D>().unwrap(),
+        "re-pointing the coefficients a leaf limb is packed from must change the verifier's \
+         preprocessed columns"
+    );
+}
+
+/// Without the recompose tables the eligible leaf hash refuses to build instead of silently
+/// falling back to the ALU chain (upstream 98b835f / 1ba9121).
+#[test]
+fn coeff_bound_leaf_hash_fails_closed_without_recompose() {
+    let mut builder = CircuitBuilder::<EF>::new();
+    builder.enable_poseidon2_perm::<BabyBearD4Width16, _>(
+        generate_poseidon2_trace::<EF, BabyBearD4Width16>,
+        default_babybear_poseidon2_16(),
+    );
+    let cap: Vec<Vec<Target>> = vec![
+        (0..CFG.rate_ext())
+            .map(|_| builder.public_input())
+            .collect(),
+    ];
+    let dimensions = [Dimensions {
+        width: LEAF_WIDTH,
+        height: 4,
+    }];
+    let index_bits: Vec<Target> = (0..2).map(|_| builder.public_input()).collect();
+    let opened: Vec<Vec<Target>> = vec![(0..LEAF_WIDTH).map(|_| builder.public_input()).collect()];
+    let err = verify_batch_circuit::<F, EF>(
+        &mut builder,
+        CFG,
+        &cap,
+        &dimensions,
+        &index_bits,
+        &opened,
+        None,
+    )
+    .expect_err("the eligible leaf hash needs the recompose/coeff table");
+    assert!(matches!(
+        err,
+        p3_circuit::CircuitBuilderError::RecomposeCoeffLookupsUnavailable
+    ));
 }
