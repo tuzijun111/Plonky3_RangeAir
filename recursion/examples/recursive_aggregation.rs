@@ -414,7 +414,7 @@ macro_rules! define_field_module_aggregation_quintic {
                                     .with_table_packing(agg_params.table_packing.clone());
                                 verifier.$register_fn::<D>($poseidon2_config);
                                 if !disable_recompose_npo {
-                                    verifier.register_recompose_table::<D>($poseidon2_config.d() != D);
+                                    verifier.register_recompose_table::<D>(true);
                                 }
                                 verifier
                                     .verify_all_tables(&out.0)
@@ -646,7 +646,7 @@ macro_rules! define_field_module {
                                     .with_table_packing(agg_params.table_packing.clone());
                                 verifier.$register_fn::<$d>($poseidon2_config);
                                 if !disable_recompose_npo {
-                                    verifier.register_recompose_table::<$d>($poseidon2_config.d() != $d);
+                                    verifier.register_recompose_table::<$d>(true);
                                 }
                                 verifier
                                     .verify_all_tables(&out.0)

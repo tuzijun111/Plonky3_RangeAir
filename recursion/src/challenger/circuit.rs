@@ -20,14 +20,20 @@
 //! `D >= 2` permutation started a fresh chain with CTL-fed capacity read from witnesses no
 //! table created with the previous permutation's capacity output, so it was prover-chosen.)
 //!
-//! Every packing and unpacking the challenger performs goes through the ALU `mul_add` chain
-//! (`recompose_base_coeffs_to_ext_via_alu` / `decompose_ext_to_base_coeffs_via_alu`), never the
-//! recompose table. The table's row holds the coefficients in free main-trace columns and
-//! publishes only its packed output on the `WitnessChecks` bus, which would leave every state
-//! coefficient — and so every absorbed value, every squeezed challenge and the limbs each
-//! permutation reads — a value the prover picks independently of the permutation that produced
-//! it. The ALU chain reads each coefficient as a bus-bound operand instead, so the whole
-//! transcript is tied to the witnesses it is derived from.
+//! No packing or unpacking goes through the plain recompose table: its row holds the
+//! coefficients in free main-trace columns and publishes only its packed output on the
+//! `WitnessChecks` bus, which would leave every state coefficient — and so every absorbed value,
+//! every squeezed challenge and the limbs each permutation reads — a value the prover picks
+//! independently of the permutation that produced it. Packing (state coefficients into limbs,
+//! squeezed coefficients into `sample_ext` challenges) uses the ALU `mul_add` chain, which reads
+//! each coefficient as a bus-bound operand. Unpacking (a permutation's rate outputs, and
+//! `observe_ext` values) uses the `recompose/coeff` table whenever the recompose NPO is enabled:
+//! it publishes each coefficient as `[idx, v_i, 0, .., 0]` next to the limb, so every coefficient
+//! the transcript hands out is a base-field element tied to the limb it came from. The ALU chain
+//! alone constrains only `sum(c_i · basis_i)`, which over an extension field leaves each
+//! coefficient `D - 1` free base dimensions — enough to move a squeezed challenge or a query
+//! index while every permutation limb stays put — so a circuit without `enable_recompose` still
+//! has that gap (upstream f89d776 closes it by requiring the table).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -191,6 +197,22 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         self.state = outputs.to_vec();
     }
 
+    /// Unpack one extension limb into base coefficients: through the `recompose/coeff` table
+    /// when the recompose NPO is enabled (each coefficient base-field and bound to the limb),
+    /// else through the ALU chain (weighted sum only).
+    fn unpack_limb<BF, EF>(circuit: &mut CircuitBuilder<EF>, limb: Target) -> Vec<Target>
+    where
+        BF: PrimeField64,
+        EF: ExtensionField<BF>,
+    {
+        if circuit.is_recompose_enabled() {
+            circuit.decompose_ext_to_base_coeffs_with_coeff_lookups::<BF>(limb)
+        } else {
+            circuit.decompose_ext_to_base_coeffs_via_alu::<BF>(limb)
+        }
+        .expect("decomposition should succeed")
+    }
+
     /// Pack the sponge state into the extension limbs the next `D >= 2` permutation reads:
     /// every limb for the chain start, only the rate limbs for a continuation (whose capacity
     /// is chained in the AIR).
@@ -238,9 +260,7 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
         // after the first step (continuations chain it in the AIR), so the capacity entries of
         // `self.state` keep the zero initial state and are never read again.
         for (limb, &ext_out) in rate_outputs.iter().enumerate() {
-            let coeffs = circuit
-                .decompose_ext_to_base_coeffs_via_alu::<BF>(ext_out)
-                .expect("decomposition should succeed");
+            let coeffs = Self::unpack_limb::<BF, EF>(circuit, ext_out);
             let start = limb * EF::DIMENSION;
             for (i, coeff) in coeffs.into_iter().enumerate() {
                 self.state[start + i] = coeff;
@@ -289,9 +309,7 @@ impl<const WIDTH: usize, const RATE: usize, C: ChallengerPermConfig>
 
         // Only the rate limbs are unpacked; see `duplexing_ext`.
         for (limb, &ext_out) in rate_outputs.iter().enumerate() {
-            let coeffs = circuit
-                .decompose_ext_to_base_coeffs_via_alu::<BF>(ext_out)
-                .expect("decomposition should succeed");
+            let coeffs = Self::unpack_limb::<BF, EF>(circuit, ext_out);
             let start = limb * EF::DIMENSION;
             for (i, coeff) in coeffs.into_iter().enumerate() {
                 self.state[start + i] = coeff;
@@ -385,9 +403,7 @@ where
 
     fn observe_ext(&mut self, circuit: &mut CircuitBuilder<EF>, value: Target) {
         // Decompose extension element to D base coefficients
-        let coeffs = circuit
-            .decompose_ext_to_base_coeffs_via_alu::<BF>(value)
-            .expect("decomposition should succeed");
+        let coeffs = Self::unpack_limb::<BF, EF>(circuit, value);
 
         // Observe each coefficient (matches native observe_algebra_element)
         for coeff in coeffs {

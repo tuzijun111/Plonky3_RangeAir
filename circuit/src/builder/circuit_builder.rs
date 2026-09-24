@@ -1504,8 +1504,14 @@ where
 
     /// Like [`Self::recompose_base_coeffs_to_ext`], but uses the `recompose/coeff` table so the
     /// BF coefficients appear on the WitnessChecks bus (per-coefficient receives).
-    /// Required for soundness when those coefficients are consumed by a D=1 Poseidon2 (or similar)
-    /// inside a higher-degree circuit.
+    /// Required for soundness when those coefficients are consumed as base-field values — by a
+    /// D=1 Poseidon2 inside a higher-degree circuit, or as transcript challenges — since the
+    /// per-coefficient receive is what makes each one a base-field element.
+    ///
+    /// # Errors
+    /// Returns [`CircuitBuilderError::RecomposeCoeffLookupsUnavailable`] without
+    /// [`Self::enable_recompose`]: the ALU `mul_add` chain ties only the weighted sum and
+    /// leaves each coefficient `D - 1` free base dimensions, so it is not a substitute.
     pub fn recompose_base_coeffs_to_ext_with_coeff_lookups<BF>(
         &mut self,
         coeffs: &[ExprId],
@@ -1584,6 +1590,12 @@ where
                 self.ext_recompose_coeffs.insert(result, coeffs.to_vec());
             }
             return Ok(result);
+        }
+
+        // The ALU chain ties only `sum(c_i * basis_i)`, so it cannot stand in for a caller that
+        // asked for the per-coefficient receives (upstream 1ba9121).
+        if coeff_lookups && !force_alu && !self.recompose_npo_enabled {
+            return Err(CircuitBuilderError::RecomposeCoeffLookupsUnavailable);
         }
 
         let result = if self.recompose_npo_enabled && !force_alu {
@@ -1768,6 +1780,45 @@ where
 
         self.pop_scope();
         Ok(coeffs)
+    }
+
+    /// Whether [`Self::enable_recompose`] was called (the `recompose` and `recompose/coeff`
+    /// NPO tables are available).
+    pub const fn is_recompose_enabled(&self) -> bool {
+        self.recompose_npo_enabled
+    }
+
+    /// Like [`Self::decompose_ext_to_base_coeffs`], but reconstructs through the
+    /// `recompose/coeff` table for this call only (port of upstream f89d776's builder method).
+    ///
+    /// The `mul_add` chain of [`Self::decompose_ext_to_base_coeffs_via_alu`] constrains
+    /// `sum(c_i · basis_i) == x` over the extension field, which leaves each returned
+    /// coefficient free to be any extension element as long as the weighted sum lands on `x`.
+    /// The `recompose/coeff` row instead publishes each coefficient as `[idx, v_i, 0, .., 0]`,
+    /// so the coefficient a caller gets back is a base-field element by construction. Callers
+    /// that hand the returned targets to something that reads them as base values — a
+    /// transcript, a repacking, a bit decomposition — need this form.
+    ///
+    /// # Errors
+    /// Returns [`CircuitBuilderError::RecomposeCoeffLookupsUnavailable`] without
+    /// [`Self::enable_recompose`].
+    ///
+    /// # Cost
+    /// D witness hints + 1 `recompose/coeff` row, in place of the D `mul_add` rows.
+    pub fn decompose_ext_to_base_coeffs_with_coeff_lookups<BF>(
+        &mut self,
+        x: ExprId,
+    ) -> Result<Vec<ExprId>, CircuitBuilderError>
+    where
+        BF: PrimeField64,
+        F: ExtensionField<BF>,
+    {
+        let saved_alu = core::mem::replace(&mut self.decompose_recompose_via_alu, false);
+        let saved_ctl = core::mem::replace(&mut self.recompose_coeff_ctl_for_decompose_links, true);
+        let coeffs = self.decompose_ext_to_base_coeffs::<BF>(x);
+        self.recompose_coeff_ctl_for_decompose_links = saved_ctl;
+        self.decompose_recompose_via_alu = saved_alu;
+        coeffs
     }
 
     /// Like [`Self::decompose_ext_to_base_coeffs`], but reconstructs through the ALU `mul_add`
@@ -3433,6 +3484,30 @@ mod proptests {
             !build_and_run(5 + p, 7),
             "a non-canonical alias in the first limb must be rejected"
         );
+    }
+
+    /// A caller asking for the per-coefficient receives must not be handed the ALU `mul_add`
+    /// chain instead (upstream 1ba9121): the chain ties only `sum(c_i * basis_i)`, so a
+    /// transcript lowered onto it lets a prover re-choose a coefficient without moving the limb.
+    #[test]
+    fn recompose_with_coeff_lookups_needs_the_recompose_table() {
+        type Ext4 = BinomialExtensionField<BabyBear, 4>;
+
+        let mut builder = CircuitBuilder::<Ext4>::new();
+        let coeffs: Vec<ExprId> = (0..4).map(|_| builder.public_input()).collect();
+
+        let err = builder
+            .recompose_base_coeffs_to_ext_with_coeff_lookups::<BabyBear>(&coeffs)
+            .expect_err("the recompose/coeff table is not enabled on this builder");
+        assert!(matches!(
+            err,
+            CircuitBuilderError::RecomposeCoeffLookupsUnavailable
+        ));
+
+        // The ALU chain stays available to callers that ask for it by name.
+        builder
+            .recompose_base_coeffs_to_ext_via_alu::<BabyBear>(&coeffs)
+            .expect("the ALU lowering is always available");
     }
 
     #[test]

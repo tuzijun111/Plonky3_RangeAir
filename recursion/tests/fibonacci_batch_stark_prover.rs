@@ -181,10 +181,10 @@ fn test_fibonacci_batch_verifier() {
     let poseidon2_config = Poseidon2Config::KOALA_BEAR_D4_W16;
     let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2Preprocessor),
-        Box::new(RecomposePreprocessor::default()),
+        Box::new(RecomposePreprocessor::new(true)),
     ];
     let mut air_builders = poseidon2_air_builders::<_, 4>();
-    air_builders.extend(recompose_air_builders(1, false));
+    air_builders.extend(recompose_air_builders(1, true));
     let (
         verification_airs_degrees,
         verification_primitive_columns,
@@ -239,7 +239,7 @@ fn test_fibonacci_batch_verifier() {
     let mut verification_prover =
         BatchStarkProver::new(config3).with_table_packing(verification_table_packing);
     verification_prover.register_poseidon2_table::<4>(poseidon2_config);
-    verification_prover.register_recompose_table::<4>(false);
+    verification_prover.register_recompose_table::<4>(true);
 
     // Prove the verification circuit
     let verification_proof = verification_prover
@@ -438,10 +438,10 @@ fn verify_fib_batch_proof_recursively(
     let verification_table_packing = TablePacking::new(1, 8);
     let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2Preprocessor),
-        Box::new(RecomposePreprocessor::default()),
+        Box::new(RecomposePreprocessor::new(true)),
     ];
     let mut air_builders = poseidon2_air_builders::<_, 4>();
-    air_builders.extend(recompose_air_builders(1, false));
+    air_builders.extend(recompose_air_builders(1, true));
     let (vad, vpc, vnpc) = get_airs_and_degrees_with_prep::<MyConfig, _, 4>(
         &verification_circuit,
         &verification_table_packing,
@@ -473,7 +473,7 @@ fn verify_fib_batch_proof_recursively(
     let vcpd = CircuitProverData::new(vpd, vpc, vnpc);
     let mut vprover = BatchStarkProver::new(config3).with_table_packing(verification_table_packing);
     vprover.register_poseidon2_table::<4>(Poseidon2Config::KOALA_BEAR_D4_W16);
-    vprover.register_recompose_table::<4>(false);
+    vprover.register_recompose_table::<4>(true);
     let vproof = vprover
         .prove_all_tables(&traces, &vcpd)
         .map_err(|e| format!("prove: {e:?}"))?;

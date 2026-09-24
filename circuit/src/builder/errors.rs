@@ -97,6 +97,12 @@ pub enum CircuitBuilderError {
     #[error("Invalid dimension: expected {expected}, got {actual}")]
     InvalidDimension { expected: usize, actual: usize },
 
+    /// A `recompose/coeff` recomposition was requested but the recompose NPO tables are not
+    /// enabled. The ALU `mul_add` chain ties only `sum(c_i * basis_i)`, which over an extension
+    /// field leaves each coefficient `D - 1` free base dimensions, so it is not a substitute.
+    #[error("recompose/coeff lookups requested but the recompose NPO table is not enabled")]
+    RecomposeCoeffLookupsUnavailable,
+
     /// A sponge-chained permutation is not the row that immediately follows its predecessor
     /// in their permutation table, so the AIR's chain constraint would bind its capacity to
     /// the wrong row.

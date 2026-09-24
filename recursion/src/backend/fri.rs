@@ -522,7 +522,9 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 2;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -539,7 +541,9 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 2 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 2;
+            // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+            // table is always registered alongside the plain one.
+            let cl = true;
             let mut provers: Vec<Box<dyn TableProver<SC>>> = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -565,7 +569,9 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 2>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 2;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders::<SC, 2>()
         } else {
@@ -651,7 +657,9 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 4;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -668,7 +676,9 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 4 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 4;
+            // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+            // table is always registered alongside the plain one.
+            let cl = true;
             let mut provers: Vec<Box<dyn TableProver<SC>>> = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -694,7 +704,9 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 4>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 4;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders::<SC, 4>()
         } else {
@@ -780,7 +792,9 @@ where
     }
 
     fn non_primitive_preprocessors(&self) -> Vec<Box<dyn NpoPreprocessor<Val<SC>>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 5;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let perm_prep = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_preprocessor::<Val<SC>>()
         } else {
@@ -797,7 +811,9 @@ where
 
     fn non_primitive_provers(&self, ext_degree: usize) -> Vec<Box<dyn TableProver<SC>>> {
         if ext_degree == 5 {
-            let cl = self.0.challenger_perm_config.extension_degree() != 5;
+            // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+            // table is always registered alongside the plain one.
+            let cl = true;
             let mut provers = match (
                 self.0.challenger_perm_config.as_poseidon1(),
                 self.0.challenger_perm_config.as_poseidon2(),
@@ -817,7 +833,9 @@ where
     }
 
     fn non_primitive_air_builders(&self) -> Vec<Box<dyn NpoAirBuilder<SC, 5>>> {
-        let cl = self.0.challenger_perm_config.extension_degree() != 5;
+        // The challenger unpacks its permutation outputs through `recompose/coeff`, so that
+        // table is always registered alongside the plain one.
+        let cl = true;
         let mut builders = if self.0.challenger_perm_config.as_poseidon1().is_some() {
             poseidon1_air_builders_d5()
         } else {

@@ -445,7 +445,7 @@ macro_rules! define_field_module {
                                 .with_table_packing(params.table_packing.clone());
                             prover.$register_fn::<$d>($poseidon2_config);
                             if !disable_recompose_npo {
-                                prover.register_recompose_table::<$d>($poseidon2_config.d() != $d);
+                                prover.register_recompose_table::<$d>(true);
                             }
                             prover.verify_all_tables(&out.0).unwrap_or_else(|e| {
                                 panic!("Failed to verify layer {layer}: {e:?}")
@@ -683,7 +683,7 @@ macro_rules! define_field_module_quintic {
                         .with_table_packing(params.table_packing.clone());
                     prover.$register_fn::<D>($poseidon2_config);
                     if !disable_recompose_npo {
-                        prover.register_recompose_table::<D>($poseidon2_config.d() != D);
+                        prover.register_recompose_table::<D>(true);
                     }
                     prover
                         .verify_all_tables(&out.0)

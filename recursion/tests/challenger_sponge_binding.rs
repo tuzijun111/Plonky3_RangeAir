@@ -227,10 +227,12 @@ fn prove_and_verify(circuit: &Circuit<EF>, traces: &Traces<EF>) -> Result<(), St
     let stark_config = config::baby_bear();
     let npo_preprocessors: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2Preprocessor),
-        Box::new(RecomposePreprocessor::default()),
+        // Both recompose tables: the challenger unpacks through `recompose/coeff` when the
+        // recompose NPO is enabled.
+        Box::new(RecomposePreprocessor::new(true)),
     ];
     let mut air_builders = poseidon2_air_builders::<BabyBearConfig, D>();
-    air_builders.extend(recompose_air_builders::<BabyBearConfig, D>(1, false));
+    air_builders.extend(recompose_air_builders::<BabyBearConfig, D>(1, true));
 
     let (airs_degrees, primitive_columns, non_primitive_columns) =
         get_airs_and_degrees_with_prep::<BabyBearConfig, EF, D>(
@@ -248,7 +250,7 @@ fn prove_and_verify(circuit: &Circuit<EF>, traces: &Traces<EF>) -> Result<(), St
         CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
     let mut prover = BatchStarkProver::new(stark_config).with_table_packing(table_packing);
     prover.register_poseidon2_table::<D>(CFG);
-    prover.register_recompose_table::<D>(false);
+    prover.register_recompose_table::<D>(true);
 
     // A bus imbalance surfaces either as a prover-side panic (the lookup debugger runs under
     // `debug_assertions`) or as a verification failure; both count as rejection.
@@ -460,6 +462,24 @@ fn rate_limb_is_bound_across_permutations_npo_table() {
         "the honest witness must carry the rate limb forward unchanged"
     );
 
+    let plain_recompose_writer = (0..honest.ops.len()).find(|&i| match &honest.ops[i] {
+        Op::NonPrimitiveOpWithExecutor { outputs, .. } => {
+            is_op_type(&honest.ops[i], "recompose") && outputs[0][0] == consumed
+        }
+        _ => false,
+    });
+    if plain_recompose_writer.is_none() {
+        // Packed by the ALU chain: its operand indices are preprocessed, so re-pointing it is
+        // not a free prover choice (and the coefficients it reads are bus-bound).
+        assert!(
+            honest
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Alu { out, .. } if *out == consumed)),
+            "the repacked rate limb must be written by an ALU op"
+        );
+        return;
+    }
     let target_row = recompose_position_writing(&honest, consumed);
     let donor_row = recompose_position_writing(&honest, second_inputs[1][0]);
     let (donor_inputs, _) = npo_io(&honest, donor_row);
@@ -557,13 +577,15 @@ fn squeezed_coefficients_are_bound_alu_chain_chosen() {
 }
 
 #[test]
-#[ignore = "open soundness gap: ALU chain leaves D-1 free base dims per coefficient (upstream f89d776)"]
 fn squeezed_coefficients_are_bound_npo_table_non_base_shift() {
     squeezed_coefficients_binding(RecomposeMode::NpoTable, Box::new(NonBaseShift(7)));
 }
 
+/// Without `enable_recompose` there is no `recompose/coeff` table to unpack through, so the
+/// challenger falls back to the ALU chain and this gap stays open for such circuits (zkSketch's
+/// recursion enables the recompose NPO; upstream f89d776 + 1ba9121 instead refuse to build).
 #[test]
-#[ignore = "open soundness gap: ALU chain leaves D-1 free base dims per coefficient (upstream f89d776)"]
+#[ignore = "open soundness gap without enable_recompose: the ALU chain leaves D-1 free base dims per coefficient"]
 fn squeezed_coefficients_are_bound_alu_chain_non_base_shift() {
     squeezed_coefficients_binding(RecomposeMode::AluChain, Box::new(NonBaseShift(7)));
 }
