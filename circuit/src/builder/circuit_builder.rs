@@ -590,7 +590,8 @@ where
     /// the reconstruction `value == Σ byte_i · 256^i` (which also forces the higher extension
     /// coefficients of `value` to zero), and looks each byte up in the shared 256-row byte table
     /// via [`Self::add_range`]. When `n_bits` is not a multiple of 8, the most-significant byte is
-    /// left-shifted by `8 - (n_bits mod 8)` so its lookup tightens the bound to `[0, 2^r)`.
+    /// looked up twice, as is and left-shifted by `8 - (n_bits mod 8)`, which tightens its bound
+    /// to `[0, 2^r)` (one extra byte-table lookup per call).
     ///
     /// Drop-in replacement for `decompose_to_bits::<BF>(value, n_bits)` when used purely for a
     /// range check: same `[0, 2^n_bits)` guarantee, but `O(ceil(n_bits/8))` shared-table lookups
@@ -642,7 +643,13 @@ where
         self.connect(value, acc);
 
         // Range-check each byte in [0, 256); tighten the most-significant byte when `n_bits`
-        // isn't byte-aligned by left-shifting it before the lookup.
+        // isn't byte-aligned by ALSO looking it up left-shifted by `8 - r`.
+        //
+        // The shifted lookup alone is not a range check: in a prime field,
+        // `byte · 2^(8−r) ∈ [0, 256)` admits `byte = v · 2^-(8−r)` for every `v < 256`, which for
+        // `v` not divisible by `2^(8−r)` is a huge field element. The unshifted lookup first pins
+        // `byte` to the integer range `[0, 256)`; then `byte · 2^(8−r) < 2^16 < p` cannot wrap, so
+        // the shifted lookup forces `byte < 2^r`.
         let r = n_bits - 8 * (k - 1); // bits in the most-significant byte, in 1..=8
         for (i, &byte) in byte_wires.iter().enumerate() {
             if i + 1 < k || r == 8 {
@@ -650,6 +657,7 @@ where
             } else {
                 let shift = self.define_const(F::from_u64(1u64 << (8 - r)));
                 let shifted = self.mul(byte, shift);
+                self.add_range(&[byte])?;
                 self.add_range(&[shifted])?;
             }
         }

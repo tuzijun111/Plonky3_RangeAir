@@ -46,14 +46,44 @@ pub struct AggregationCircuitFingerprint {
     pub public_flat_len: usize,
     pub private_flat_len: usize,
     pub ops_len: usize,
+    /// Deterministic digest of every `Op::Const` (output witness and value), in op order.
+    /// Constant values are part of the committed preprocessed data (`ConstAir`), so two
+    /// circuits of the same shape but with different constants (e.g. a different baked child
+    /// VK) must not share cached prover data.
+    pub consts_digest: u64,
 }
 
-const fn aggregation_circuit_fingerprint<F>(circuit: &Circuit<F>) -> AggregationCircuitFingerprint {
+fn aggregation_circuit_fingerprint<F: Field>(circuit: &Circuit<F>) -> AggregationCircuitFingerprint {
+    use core::hash::{Hash, Hasher};
+
+    use p3_circuit::ops::Op;
+
+    /// FNV-1a: fixed seed, so equal circuits give equal digests across calls and processes.
+    struct Fnv1a(u64);
+    impl Hasher for Fnv1a {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+
+    let mut h = Fnv1a(0xcbf2_9ce4_8422_2325);
+    for op in &circuit.ops {
+        if let Op::Const { out, val } = op {
+            out.0.hash(&mut h);
+            val.hash(&mut h);
+        }
+    }
     AggregationCircuitFingerprint {
         witness_count: circuit.witness_count,
         public_flat_len: circuit.public_flat_len,
         private_flat_len: circuit.private_flat_len,
         ops_len: circuit.ops.len(),
+        consts_digest: h.finish(),
     }
 }
 

@@ -926,13 +926,29 @@ pub(crate) fn eval<
 
         // Sponge chain starts (next row new_start, not Merkle): capacity is never witness-fed;
         // replacing the former zero-constant CTL sends for slots RATE_EXT..WIDTH_EXT.
+        //
+        // No transition selector: gate and state both come from the `next` row, so the
+        // wrap-around window also covers row 0 (the first sponge of the table, which has no
+        // predecessor and was previously left unconstrained).
         for slot in RATE_EXT..WIDTH_EXT {
             for d in 0..D {
                 builder
-                    .when_transition()
                     .when(next_new_start)
                     .when(not_merkle.clone())
                     .assert_zero(next_in[slot * D + d]);
+            }
+        }
+        // Likewise a rate limb that a sponge chain start does not CTL-feed (a partial first
+        // chunk) holds the zero IV. `(1 − merkle)(1 − in_ctl_i) − sponge_helper_i` equals
+        // `new_start · (1 − merkle) · (1 − in_ctl_i)` on rows built from circuit ops, and 1 on
+        // all-zero padding rows (whose input state is zero).
+        for limb in 0..RATE_EXT {
+            let gate = not_merkle.clone() * (AB::Expr::ONE - s[limb].into())
+                - s[rate_sponge_base + limb].into();
+            for d in 0..D {
+                builder
+                    .when(gate.clone())
+                    .assert_zero(next_in[limb * D + d]);
             }
         }
 
@@ -970,6 +986,32 @@ pub(crate) fn eval<
                     .when_transition()
                     .when(gate)
                     .assert_zero(next_in[limb * D + d] - local_out[limb * D + d]);
+            }
+        }
+
+        // Sponge chain starts: a `new_start` sponge row opens a fresh sponge, so every input
+        // limb that is not CTL-fed (the capacity, and any rate limb the first chunk leaves
+        // unfilled) must hold the zero IV, exactly as the executor's `init_chain_state` fills
+        // it. Without this, those limbs are unconstrained on a `new_start` row (no CTL, no
+        // chaining) and the prover picks the IV.
+        //
+        // The gate `(1 − merkle)(1 − in_ctl) − normal_chain_sel` equals
+        // `new_start · (1 − merkle) · (1 − in_ctl)` on every row built from circuit ops (where
+        // `normal_chain_sel = (1 − new_start)(1 − merkle)(1 − in_ctl)`), keeping the constraint
+        // at degree 3 without new preprocessed columns. On all-zero padding rows it is 1, and
+        // padding rows carry a zero input state.
+        //
+        // Gate and state both come from the `next` row with no transition selector, so the
+        // wrap-around window also covers row 0.
+        let not_next_merkle = AB::Expr::ONE - next_prep.merkle_path.into();
+        for limb in 0..WIDTH_EXT {
+            let limb_prep = &next_prep.input_limbs[limb];
+            let gate = not_next_merkle.clone() * (AB::Expr::ONE - limb_prep.in_ctl.into())
+                - limb_prep.normal_chain_sel.into();
+            for d in 0..D {
+                builder
+                    .when(gate.clone())
+                    .assert_zero(next_in[limb * D + d]);
             }
         }
 
@@ -1601,7 +1643,8 @@ mod test {
         let mut rng = SmallRng::seed_from_u64(1);
         let (constants, perm) = make_constants_and_perm(&mut rng);
 
-        // Row A: new_start=true, sponge mode - use random initial state.
+        // Row A: new_start=true, sponge mode - use random initial state. Every limb is CTL-fed:
+        // a sponge chain start's non-CTL limbs must hold the zero IV.
         let state_a: [Val; WIDTH] = core::array::from_fn(|_| rng.random());
         let output_a = perm.permute(state_a);
         let sponge_a = Poseidon2CircuitRow {
@@ -1610,7 +1653,7 @@ mod test {
             mmcs_bit: false,
             mmcs_index_sum: Val::ZERO,
             input_values: state_a.to_vec(),
-            in_ctl: vec![false; POSEIDON2_LIMBS],
+            in_ctl: vec![true; POSEIDON2_LIMBS],
             input_indices: vec![0; POSEIDON2_LIMBS],
             out_ctl: vec![false; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
             output_indices: vec![0; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
@@ -1680,7 +1723,8 @@ mod test {
         let mut rng = SmallRng::seed_from_u64(42);
         let (constants, perm) = make_constants_and_perm(&mut rng);
 
-        // Row A: new_start, random state.
+        // Row A: new_start, random state, every limb CTL-fed (a sponge chain start's non-CTL
+        // limbs must hold the zero IV).
         let state_a: [Val; WIDTH] = core::array::from_fn(|_| rng.random());
         let output_a = perm.permute(state_a);
         let row_a = Poseidon2CircuitRow {
@@ -1689,7 +1733,7 @@ mod test {
             mmcs_bit: false,
             mmcs_index_sum: Val::ZERO,
             input_values: state_a.to_vec(),
-            in_ctl: vec![false; POSEIDON2_LIMBS],
+            in_ctl: vec![true; POSEIDON2_LIMBS],
             input_indices: vec![0; POSEIDON2_LIMBS],
             out_ctl: vec![false; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
             output_indices: vec![0; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
@@ -1807,6 +1851,75 @@ mod test {
         };
 
         check_rows(vec![row_0, row_1, row_2], &constants);
+    }
+
+    /// A sponge chain start (`new_start`, not Merkle) with input `state`; `in_ctl[l]` marks the
+    /// CTL-fed limbs (`D = 4` values each).
+    fn sponge_start(state: [Val; WIDTH], in_ctl: Vec<bool>) -> Poseidon2CircuitRow<Val> {
+        Poseidon2CircuitRow {
+            new_start: true,
+            merkle_path: false,
+            mmcs_bit: false,
+            mmcs_index_sum: Val::ZERO,
+            input_values: state.to_vec(),
+            in_ctl,
+            input_indices: vec![0; POSEIDON2_LIMBS],
+            out_ctl: vec![false; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
+            output_indices: vec![0; POSEIDON2_PUBLIC_OUTPUT_LIMBS],
+            mmcs_index_sum_idx: 0,
+            mmcs_ctl_enabled: false,
+        }
+    }
+
+    /// Rate limb 0 CTL-fed, every other limb at the zero IV: the honest one-chunk sponge start
+    /// (e.g. hashing a single extension element). Satisfied at row 0 and mid-table.
+    #[test]
+    fn sponge_start_accepts_zero_iv_with_partial_ctl() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let (constants, _) = make_constants_and_perm(&mut rng);
+        let mut state = [Val::ZERO; WIDTH];
+        for v in &mut state[0..4] {
+            *v = rng.random();
+        }
+        let ctl = vec![true, false, false, false];
+        check_rows(
+            vec![sponge_start(state, ctl.clone()), sponge_start(state, ctl)],
+            &constants,
+        );
+    }
+
+    /// A nonzero capacity value on the table's FIRST row (a sponge chain start without CTL on
+    /// the capacity) is rejected: the check reaches row 0 through the wrap-around window.
+    #[test]
+    #[should_panic(expected = "AIR constraint failed")]
+    fn sponge_start_rejects_free_capacity_on_row_0() {
+        let mut rng = SmallRng::seed_from_u64(8);
+        let (constants, _) = make_constants_and_perm(&mut rng);
+        let mut state = [Val::ZERO; WIDTH];
+        state[0] = Val::from_u32(5);
+        state[8] = Val::ONE; // capacity limb 2, coefficient 0
+        check_rows(
+            vec![sponge_start(state, vec![true, false, false, false])],
+            &constants,
+        );
+    }
+
+    /// A nonzero, non-CTL RATE limb on a mid-table sponge chain start (a partial first chunk
+    /// whose unfilled rate limb is prover-chosen) is rejected.
+    #[test]
+    #[should_panic(expected = "AIR constraint failed")]
+    fn sponge_start_rejects_free_unfilled_rate_limb_mid_table() {
+        let mut rng = SmallRng::seed_from_u64(9);
+        let (constants, _) = make_constants_and_perm(&mut rng);
+        let mut honest = [Val::ZERO; WIDTH];
+        honest[0] = Val::from_u32(5);
+        let mut forged = honest;
+        forged[5] = Val::from_u32(3); // rate limb 1, coefficient 1, not CTL-fed
+        let ctl = vec![true, false, false, false];
+        check_rows(
+            vec![sponge_start(honest, ctl.clone()), sponge_start(forged, ctl)],
+            &constants,
+        );
     }
 
     #[test]

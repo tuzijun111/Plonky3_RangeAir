@@ -740,3 +740,116 @@ fn range_bits_d4_rejects_out_of_range() {
     );
     eprintln!("[soundness] out-of-range 22-bit value rejected via {outcome:?} — expected.");
 }
+
+/// Soundness (adversarial): `add_range_bits(_, 22)` must reject a FORGED trace that encodes a
+/// value `>= 2^22` with an inverse-shifted top byte. `22 = 2·8 + 6`, so the top byte is
+/// looked up shifted by `2^2`. A shifted-only lookup accepts `b2 = 255·4^{-1} mod p` (a huge
+/// field element whose shifted image `255` is a byte), making the recomposed value
+/// `b0 + 256·b1 + 65536·b2 = b0 + 256·b1 + 16384·255 >= 2^22`. The unshifted top-byte lookup
+/// rejects it.
+///
+/// Honest: `d = 3_000_000 = 0x2DC6C0` (bytes 192, 198, 45; shifted top byte 180). Forged:
+/// bytes 192, 198, `255·4^{-1}`; shifted top byte 255; `d = 4_228_800`. Every trace value
+/// derived from `d` (the public input `a = d + 50`, the ALU rows, the Range inputs) is
+/// rewritten consistently, so only the byte-table lookup can reject.
+#[test]
+fn range_bits_d4_rejects_inverse_shift_top_byte_forgery() {
+    type BF = BabyBear;
+    type EF = BinomialExtensionField<BabyBear, 4>;
+    const D: usize = 4;
+
+    let mut builder = CircuitBuilder::<EF>::new();
+    builder.enable_range(generate_range_trace::<BF, EF>);
+    let a = builder.public_input();
+    let b = builder.public_input();
+    let d = builder.sub(a, b);
+    builder
+        .add_range_bits::<BF>(d, 22)
+        .expect("add_range_bits should accept the check structurally");
+    let circuit = builder.build().expect("build d4 range_bits circuit");
+    let cfg = config::baby_bear();
+
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<config::BabyBearConfig, _, D>(
+            &circuit,
+            &TablePacking::default(),
+            &[range_preprocessor::<BF>()],
+            &range_air_builders::<config::BabyBearConfig, D>(1),
+            ConstraintProfile::Standard,
+        )
+        .expect("get_airs_and_degrees_with_prep should succeed");
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let prover_data = p3_batch_stark::ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let mut prover = BatchStarkProver::new(cfg);
+    prover.register_range_table::<D>();
+
+    let prove_verify = |traces: &p3_circuit::tables::Traces<EF>| {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match prover.prove_all_tables(traces, &circuit_prover_data) {
+                Ok(proof) => prover.verify_all_tables(&proof).is_ok(),
+                Err(_) => false,
+            }
+        }));
+        std::panic::set_hook(prev_hook);
+        matches!(outcome, Ok(true))
+    };
+
+    let mut runner = circuit.runner();
+    runner
+        .set_public_inputs(&[EF::from_u64(3_000_050), EF::from_u64(50)])
+        .expect("set public inputs");
+    let mut traces = runner.run().expect("run d4 range_bits circuit");
+    assert!(prove_verify(&traces), "the honest 22-bit value must verify");
+
+    let b2_forged = BF::from_u64(255) * BF::from_u64(4).inverse();
+    let d_forged = BF::from_u64(192) + BF::from_u64(256 * 198) + BF::from_u64(65536) * b2_forged;
+    assert_eq!(d_forged, BF::from_u64(4_228_800));
+    let remap: [(BF, BF); 4] = [
+        (BF::from_u64(3_000_050), BF::from_u64(4_228_850)),
+        (BF::from_u64(3_000_000), d_forged),
+        (BF::from_u64(45), b2_forged),
+        (BF::from_u64(180), BF::from_u64(255)),
+    ];
+    let map = |v: EF| -> EF {
+        for &(h, f) in &remap {
+            if v == EF::from(h) {
+                return EF::from(f);
+            }
+        }
+        v
+    };
+    for row in traces.alu_trace.values.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = map(*slot);
+        }
+    }
+    for v in traces.public_trace.values.iter_mut() {
+        *v = map(*v);
+    }
+    let rid = NpoTypeId::range();
+    let mut rt: p3_circuit::ops::RangeTrace<BF> = traces
+        .non_primitive_trace::<p3_circuit::ops::RangeTrace<BF>>(&rid)
+        .expect("range trace")
+        .clone();
+    for op in rt.operations.iter_mut() {
+        for v in op.input_values.chunks_mut(D) {
+            for &(h, f) in &remap {
+                if v[0] == h && v[1..].iter().all(|c| *c == BF::ZERO) {
+                    v[0] = f;
+                    break;
+                }
+            }
+        }
+    }
+    traces.non_primitive_traces.insert(rid, Box::new(rt));
+
+    assert!(
+        !prove_verify(&traces),
+        "a forged top byte 255·4^-1 (d = 4_228_800 >= 2^22) must be rejected by \
+         add_range_bits(_, 22)"
+    );
+}
