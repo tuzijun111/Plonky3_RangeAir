@@ -50,7 +50,7 @@ mod recompose;
 pub use dynamic_air::{
     BatchAir, BatchTableInstance, CloneableBatchAir, DynamicAirEntry, TableProver,
 };
-pub use packing::TablePacking;
+pub use packing::{DEFAULT_ZK_MIN_TRACE_HEIGHT, TablePacking};
 pub use poseidon1::{
     Poseidon1AirBuilder, Poseidon1AirWrapperInner, Poseidon1Preprocessor, Poseidon1Prover,
     Poseidon1ProverD2, poseidon1_preprocessor, poseidon1_verifier_air_from_config,
@@ -612,6 +612,17 @@ pub enum BatchStarkProverError {
     /// Proof metadata failed structural validation before verification.
     #[error("invalid proof metadata: {0}")]
     InvalidMetadata(#[from] ProofMetadataError),
+
+    /// A zero-knowledge proof was requested with tables that may be shorter than the hiding
+    /// budget ([`TablePacking::zk_min_trace_height`]).
+    #[error(
+        "ZK proving requires min_trace_height >= {required} (hiding budget), got {min_trace_height}; \
+         raise it with TablePacking::with_fri_params / with_min_trace_height"
+    )]
+    ZkTraceHeightBelowHidingBudget {
+        min_trace_height: usize,
+        required: usize,
+    },
 }
 
 impl<SC, const D: usize> BaseAir<Val<SC>> for CircuitTableAir<SC, D>
@@ -1142,6 +1153,17 @@ where
         // Build matrices and AIRs per table.
         let packing = &self.table_packing;
         let min_height = packing.min_trace_height();
+
+        // Hiding budget: under ZK every table (padded to at least `min_height` rows below) must be
+        // tall enough for its randomized columns, including the LogUp masks and the auxiliary
+        // columns, to stay hidden given what the openings reveal. The pinned `HidingFriPcs` does
+        // not enforce this, so refuse to produce a proof that might not be zero-knowledge.
+        if self.config.is_zk() != 0 && min_height < packing.zk_min_trace_height() {
+            return Err(BatchStarkProverError::ZkTraceHeightBelowHidingBudget {
+                min_trace_height: min_height,
+                required: packing.zk_min_trace_height(),
+            });
+        }
 
         // Check if Alu table has only dummy operations (trace length <= 1).
         // The table implementation adds a dummy row when empty, so we check for <= 1.

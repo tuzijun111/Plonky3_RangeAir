@@ -1304,8 +1304,13 @@ where
         //
         // This is a zero-copy cast enabled by the `#[repr(C)]` layout
         // and the `Borrow` implementations in the columns module.
-        let local = main.current_slice().borrow();
-        let next = main.next_slice().borrow();
+        //
+        // Only this AIR's own `width()` columns are borrowed: under ZK the
+        // window also holds trailing LogUp mask columns, which belong to the
+        // lookup argument and are never read here.
+        let own_width = BaseAir::<AB::F>::width(self);
+        let local = main.current_slice()[..own_width].borrow();
+        let next = main.next_slice()[..own_width].borrow();
 
         // Get the preprocessed trace window and extract both rows.
         //

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::ProofMetadataError;
 
 /// Configuration for packing multiple primitive operations into a single AIR row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Equality ignores [`Self::zk_min_trace_height`], which is a prover-side policy and is not
+/// serialized (so the proof metadata, and the bytes of serialized proofs, are unchanged by it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TablePacking {
     /// Number of public-input operations packed per AIR row.
     public_lanes: usize,
@@ -24,11 +27,50 @@ pub struct TablePacking {
     /// Must be at least 2. Default 2 matches the previous double-step Horner layout.
     #[serde(default = "default_horner_pack_k")]
     horner_packed_steps: usize,
+    /// Smallest `min_trace_height` accepted when proving with a zero-knowledge PCS (the
+    /// hiding budget). Prover-side only: never serialized, ignored by equality.
+    #[serde(skip, default = "default_zk_min_trace_height")]
+    zk_min_trace_height: usize,
 }
 
 const fn default_horner_pack_k() -> usize {
     2
 }
+
+/// Default hiding budget for [`TablePacking::zk_min_trace_height`].
+///
+/// Under ZK each committed column of a table of base height `n` is a polynomial of degree below
+/// `2n` with `n` random interleaved rows. The verifier learns `D` base-field values per
+/// out-of-domain opening point (`zeta`, `g * zeta`) and one value per FRI query; the openings are
+/// jointly uniform, so the column stays hidden, when `n >= 2 * (num_queries + D * points)`. For
+/// `num_queries = 54`, `D = 4` and 2 points this is 124, rounded up to the next power of two:
+/// 128. This covers the LogUp masks and the auxiliary (permutation) columns.
+pub const DEFAULT_ZK_MIN_TRACE_HEIGHT: usize = 128;
+
+const fn default_zk_min_trace_height() -> usize {
+    DEFAULT_ZK_MIN_TRACE_HEIGHT
+}
+
+impl PartialEq for TablePacking {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructure so that a new layout field cannot be silently left out of the comparison.
+        let Self {
+            public_lanes,
+            alu_lanes,
+            npo_lanes,
+            min_trace_height,
+            horner_packed_steps,
+            zk_min_trace_height: _,
+        } = self;
+        *public_lanes == other.public_lanes
+            && *alu_lanes == other.alu_lanes
+            && *npo_lanes == other.npo_lanes
+            && *min_trace_height == other.min_trace_height
+            && *horner_packed_steps == other.horner_packed_steps
+    }
+}
+
+impl Eq for TablePacking {}
 
 /// Sanity ceiling for lane counts and `horner_packed_steps` in [`TablePacking::validate`].
 ///
@@ -49,6 +91,7 @@ impl TablePacking {
             npo_lanes: Vec::new(),
             min_trace_height: 1,
             horner_packed_steps: 2,
+            zk_min_trace_height: DEFAULT_ZK_MIN_TRACE_HEIGHT,
         }
     }
 
@@ -142,6 +185,40 @@ impl TablePacking {
     /// Number of consecutive HornerAcc steps packed into one scheduled ALU row (lane 0).
     pub const fn horner_packed_steps(&self) -> usize {
         self.horner_packed_steps
+    }
+
+    /// Smallest [`Self::min_trace_height`] that [`super::BatchStarkProver`] accepts when the
+    /// PCS is zero-knowledge (default [`DEFAULT_ZK_MIN_TRACE_HEIGHT`]).
+    ///
+    /// Every table is padded to at least `min_trace_height` rows, so this bounds the base
+    /// height of every committed table from below. A table is hidden only if its base height
+    /// exceeds the number of linear functionals the verifier learns about each column; see
+    /// [`Self::zk_hiding_budget`]. The pinned `HidingFriPcs` does not check this itself.
+    pub const fn zk_min_trace_height(&self) -> usize {
+        self.zk_min_trace_height
+    }
+
+    /// Override the ZK hiding budget (see [`Self::zk_min_trace_height`]).
+    ///
+    /// Only lower it below [`DEFAULT_ZK_MIN_TRACE_HEIGHT`] when the FRI parameters in use reveal
+    /// fewer values, i.e. to at least `zk_hiding_budget(num_queries, D, 2)` for those parameters
+    /// (for example in tests with few queries). Proofs below the budget are still sound but may
+    /// leak the masked LogUp sums and auxiliary columns.
+    #[must_use]
+    pub const fn with_zk_min_trace_height(mut self, zk_min_trace_height: usize) -> Self {
+        self.zk_min_trace_height = zk_min_trace_height;
+        self
+    }
+
+    /// Hiding budget for the given FRI query count, extension degree and number of out-of-domain
+    /// opening points: `2 * (num_queries + ext_degree * opening_points)`, rounded up to a power of
+    /// two. For 54 queries, `D = 4` and 2 points (`zeta`, `g * zeta`) this is 128.
+    pub const fn zk_hiding_budget(
+        num_queries: usize,
+        ext_degree: usize,
+        opening_points: usize,
+    ) -> usize {
+        (2 * (num_queries + ext_degree * opening_points)).next_power_of_two()
     }
 
     /// Re-check the invariants the builder methods enforce, after deserialization.

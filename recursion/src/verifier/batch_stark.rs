@@ -21,7 +21,7 @@ use p3_commit::{Pcs, PolynomialSpace};
 use p3_field::{
     Algebra, BasedVectorSpace, ExtensionField, Field, PrimeCharacteristicRing, PrimeField64,
 };
-use p3_lookup::{Kind, Lookup, LookupData, LookupProtocol};
+use p3_lookup::{Kind, Lookup, LookupData, LookupProtocol, lookup_mask_width};
 use p3_uni_stark::{StarkGenericConfig, SymbolicExpression, SymbolicExpressionExt, Val};
 
 use super::{ObservableCommitment, VerificationError, recompose_quotient_from_chunks_circuit};
@@ -467,6 +467,24 @@ where
         return Err(VerificationError::RandomizationError);
     }
 
+    // Expected committed main width of each instance: the AIR's own columns plus, under ZK,
+    // the trailing LogUp mask columns (D per global lookup). It is derived from this
+    // verifier's own lookups and PCS type, never from the proof, and it fixes the lookup mode
+    // (plain or masked) before any constraint is evaluated. It drives both the opened-width
+    // shape check and the width bound in the transcript, matching the native verifier.
+    let main_widths: Vec<usize> = airs
+        .iter()
+        .zip(all_lookups.iter())
+        .map(|(air, lookups)| {
+            A::width(air)
+                + lookup_mask_width(
+                    lookups,
+                    <SC::Challenge as BasedVectorSpace<Val<SC>>>::DIMENSION,
+                    SC::Pcs::ZK,
+                )
+        })
+        .collect();
+
     // Pre-compute per-instance quotient degrees and preprocessed widths, and validate proof shape.
     let mut preprocessed_widths = Vec::with_capacity(airs.len());
     let mut log_quotient_degrees = Vec::with_capacity(n_instances);
@@ -501,7 +519,7 @@ where
                 "Instance has incorrect preprocessed width: expected {pre_w}, got {local_prep_len} / {next_prep_len}"
             )));
         }
-        let air_width = A::width(air);
+        let air_width = main_widths[i];
         if trace_local_targets.len() != air_width || trace_next_targets.len() != air_width {
             return Err(VerificationError::InvalidProofShape(format!(
                 "Instance has incorrect trace width: expected {}, got {} / {}",
@@ -609,10 +627,10 @@ where
     );
     challenger.observe_ext(circuit, inst_count_target);
 
-    for ((&ext_db, quotient_degree), air) in degree_bits
+    for ((&ext_db, quotient_degree), &main_width) in degree_bits
         .iter()
         .zip(quotient_degrees.iter())
-        .zip(airs.iter())
+        .zip(main_widths.iter())
     {
         let base_db = ext_db.checked_sub(config.is_zk()).ok_or_else(|| {
             VerificationError::InvalidProofShape(
@@ -623,8 +641,8 @@ where
             circuit.alloc_const(SC::Challenge::from_usize(base_db), "base degree bits");
         let ext_db_target =
             circuit.alloc_const(SC::Challenge::from_usize(ext_db), "extended degree bits");
-        let width_target =
-            circuit.alloc_const(SC::Challenge::from_usize(A::width(air)), "air width");
+        // Committed main width (AIR width + ZK mask columns), as the native verifier binds it.
+        let width_target = circuit.alloc_const(SC::Challenge::from_usize(main_width), "air width");
         let quotient_chunks_target = circuit.alloc_const(
             SC::Challenge::from_usize(*quotient_degree),
             "quotient chunk count",

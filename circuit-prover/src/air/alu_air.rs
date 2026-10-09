@@ -745,10 +745,14 @@ where
         eval_alu_interactions::<AB, D>(self, builder);
 
         let main = builder.main();
-        debug_assert_eq!(
+        // Under ZK the main window also holds the LogUp mask columns, which trail this AIR's
+        // own `total_width()` columns. They are owned by the lookup argument: this AIR never
+        // reads them, and its constraint set must not depend on the window width.
+        debug_assert!(
+            main.current_slice().len() >= self.total_width(),
+            "column width mismatch: window {} narrower than the AIR width {}",
             main.current_slice().len(),
-            self.total_width(),
-            "column width mismatch"
+            self.total_width()
         );
 
         let local = main.current_slice();
@@ -844,7 +848,10 @@ where
             let k_max = self.horner_packed_steps;
             let num_int = num_horner_intermediates(k_max);
             let extra_coeff_width = (num_int + 2 * (k_max - 1) + 1) * D;
-            let has_extra_cols = extra_main + extra_coeff_width <= local.len()
+            // Compare against the AIR's own width, not the window length, so that the constraint
+            // set never depends on the window: under ZK the window also holds trailing LogUp mask
+            // columns, which are not Horner columns.
+            let has_extra_cols = extra_main + extra_coeff_width <= self.total_width()
                 && extra_prep + horner_extra_prep_width(k_max) <= prep_local.len()
                 && extra_prep + horner_extra_prep_width(k_max) <= prep_next.len();
 

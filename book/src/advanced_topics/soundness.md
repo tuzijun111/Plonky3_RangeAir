@@ -69,6 +69,40 @@ The circuit challenger implements a duplex sponge construction identical to Plon
 
 The recursive verifier supports ZK-enabled STARK configurations, including batch recursion transcript/randomization handling.
 
+With a ZK PCS, the Plonky3 core this fork builds on (the `zk-logup-mask` branch) blinds the
+global LogUp cumulative sums, which a proof reveals in the clear and which would otherwise be a
+deterministic function of the witness and of challenges the verifier can recompute:
+
+- Each global lookup (one per `push_interaction`) gets an extension-field mask `rho`, stored as
+  `D` constant main columns appended after the AIR's own `width()` columns. The masks of each bus
+  are drawn from the PCS hiding randomness and sum to zero over the batch.
+- The mask columns are committed with the main trace, i.e. before the lookup challenges are
+  sampled, so they are constants fixed in advance and cannot balance an unbalanced bus. Only the
+  last-row LogUp binding reads them: `(c' - rho - s[n-1]) * den - num = 0`, and the revealed value
+  is `c' = rho + (true sum)`. The per-bus check that the revealed values sum to zero is unchanged.
+- The lookup mode is fixed by the committed main width. Every verifier (native, in-circuit in
+  `verify_batch_circuit`, and the transcript replay in `generate_batch_challenges`) derives the
+  expected width as `width() + lookup_mask_width(lookups, D, SC::Pcs::ZK)` from its own lookups
+  and configuration, never from the proof, checks the opened width against it, and binds it in
+  the transcript. Without ZK the width, the constraints and the proofs are unchanged.
+
+Requirements:
+
+- **AIR contract.** Under ZK an AIR with global lookups sees trailing mask columns in its main
+  window. It must only read its own `width()` columns, must not assert on the window length and
+  must not let its constraint set depend on it (the ALU and the Poseidon1/Poseidon2 circuit AIRs
+  follow this; `recursion/tests/zk_mask_air_contract.rs` checks every recursion table).
+- **Hiding budget.** A column is hidden only if its table is taller than the number of values the
+  verifier learns about it (openings at `zeta` and `g * zeta`, one value per FRI query). Under ZK
+  `BatchStarkProver` refuses a `TablePacking` whose `min_trace_height` is below
+  `zk_min_trace_height` (default 128 = `zk_hiding_budget(54, 4, 2)`); lower it only for FRI
+  parameters with fewer queries.
+- **Randomness.** The PCS RNG must be a CSPRNG that is not replayed across proofs (seeded test
+  RNGs, or clones of a PCS whose RNG copies its state, replay the masks).
+
+Still revealed under ZK: table heights, public values, and the masked sums themselves (uniform
+subject to summing to zero per bus).
+
 ### Challenger Poseidon2: CTL-verified
 
 The Fiat-Shamir challenger's Poseidon2 permutations are connected to the Poseidon2 AIR table via cross-table lookups (CTLs). The circuit builder's `add_poseidon2_perm_for_challenger` / `add_poseidon2_perm_for_challenger_base` use the standard Poseidon2 non-primitive op with full input and rate-output CTL exposure; the executor runs the real permutation and the lookup argument enforces that the (input, output) pair appears in the Poseidon2 table. The MMCS Poseidon2 calls (Merkle verification) are also CTL-verified.

@@ -11,7 +11,7 @@ use p3_commit::{BatchOpening, Mmcs, OpenedValues, Pcs, PolynomialSpace};
 use p3_field::{Algebra, BasedVectorSpace, PrimeCharacteristicRing, PrimeField, TwoAdicField};
 use p3_fri::{FriProof, HidingFriPcs, TwoAdicFriPcs};
 use p3_lookup::symbolic::InteractionSymbolicBuilder;
-use p3_lookup::{Kind, Lookup, LookupProtocol};
+use p3_lookup::{Kind, Lookup, LookupProtocol, lookup_mask_width};
 use p3_uni_stark::{Domain, StarkGenericConfig, SymbolicExpression, SymbolicExpressionExt, Val};
 use thiserror::Error;
 
@@ -222,12 +222,15 @@ where
                     "extended degree smaller than zk adjustment",
                 ))?;
 
-        transcript.observe_instance_binding(
-            ext_db,
-            base_db,
-            A::width(&airs[i]),
-            quotient_degrees[i],
-        );
+        // Committed main width: AIR width plus, under ZK, the LogUp mask columns, exactly as
+        // the native prover and verifiers bind it.
+        let main_width = A::width(&airs[i])
+            + lookup_mask_width(
+                &all_lookups[i],
+                <SC::Challenge as BasedVectorSpace<Val<SC>>>::DIMENSION,
+                SC::Pcs::ZK,
+            );
+        transcript.observe_instance_binding(ext_db, base_db, main_width, quotient_degrees[i]);
     }
 
     transcript.observe_main(&commitments.main, public_values);

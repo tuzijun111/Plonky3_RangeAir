@@ -6,9 +6,9 @@ use p3_air::{Air, SymbolicExpressionExt};
 use p3_batch_stark::symbolic::{get_log_num_quotient_chunks, get_symbolic_constraints};
 use p3_circuit::CircuitBuilder;
 use p3_circuit::symbolic::{ColumnsTargets, SymbolicCompiler};
-use p3_field::{Algebra, ExtensionField, Field};
+use p3_field::{Algebra, BasedVectorSpace, ExtensionField, Field};
 use p3_lookup::symbolic::InteractionSymbolicBuilder;
-use p3_lookup::{Kind, Lookup, LookupData, LookupProtocol};
+use p3_lookup::{Kind, Lookup, LookupData, LookupProtocol, lookup_mask_width};
 use p3_uni_stark::SymbolicExpression;
 
 use crate::Target;
@@ -114,9 +114,23 @@ where
             .iter()
             .filter(|c| matches!(&c.kind, Kind::Global(_)))
             .count();
+        // The layout uses the opened main width. Under ZK it includes the trailing LogUp mask
+        // columns, and that width is what selects the masked lookup constraints. Callers must
+        // have shape-checked it against `width() + lookup_mask_width(..)`, derived from their
+        // own configuration (the batch verifier does so before evaluating constraints).
+        let main_width = columns.local_values.len();
+        debug_assert!(
+            main_width == self.width()
+                || main_width
+                    == self.width()
+                        + lookup_mask_width(contexts, <EF as BasedVectorSpace<F>>::DIMENSION, true),
+            "opened main width {main_width} is neither the AIR width {} nor the AIR width plus \
+             the ZK LogUp mask columns",
+            self.width()
+        );
         let layout = AirLayout {
             preprocessed_width: num_preprocessed,
-            main_width: self.width(),
+            main_width,
             num_public_values: self.num_public_values(),
             num_permutation_values,
             ..Default::default()
@@ -164,6 +178,8 @@ where
         SymbolicExpressionExt<F, EF>: Algebra<SymbolicExpression<F>>,
         LG: LookupProtocol,
     {
+        // The plain AIR width is correct in both lookup modes: the ZK-masked last-row LogUp
+        // binding has the same degree as the plain one, so the quotient degree is unchanged.
         let layout = AirLayout {
             preprocessed_width,
             main_width: self.width(),
