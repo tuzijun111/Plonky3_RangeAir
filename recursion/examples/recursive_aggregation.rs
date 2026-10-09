@@ -351,7 +351,8 @@ macro_rules! define_field_module_aggregation_quintic {
                 }
 
                 let base_table_packing = TablePacking::new(1, 1)
-                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
+                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
+                    .with_zk_num_queries(fri_params.num_queries(security_level));
                 let backend = FriRecursionBackend::<$backend_width, $backend_rate, _>::new_d5(
                     $poseidon2_config,
                 );
@@ -390,7 +391,8 @@ macro_rules! define_field_module_aggregation_quintic {
                                 .with_fri_params(
                                     fri_params.log_final_poly_len,
                                     fri_params.log_blowup,
-                                ),
+                                )
+                                .with_zk_num_queries(fri_params.num_queries(security_level)),
                                 constraint_profile: ConstraintProfile::Standard,
                             };
                             let agg_config: $cfg_type = $config_agg(level as u64);
@@ -582,7 +584,8 @@ macro_rules! define_field_module {
                 disable_recompose_npo: bool,
             ) {
                 let base_table_packing = TablePacking::new(1, 1)
-                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
+                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
+                    .with_zk_num_queries(fri_params.num_queries(security_level));
                 let backend = FriRecursionBackend::<$backend_width, $backend_rate, _>::new(
                     $poseidon2_config,
                 )
@@ -622,7 +625,8 @@ macro_rules! define_field_module {
                                 .with_fri_params(
                                     fri_params.log_final_poly_len,
                                     fri_params.log_blowup,
-                                ),
+                                )
+                                .with_zk_num_queries(fri_params.num_queries(security_level)),
                                 constraint_profile: ConstraintProfile::Standard,
                             };
                             let agg_config: $cfg_type = $config_agg(level as u64);

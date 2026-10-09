@@ -45,6 +45,8 @@ p3-circuit.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
+# Test-only mask hook for the adversarial zero-knowledge LogUp tests (zk_logup_mask*.rs).
+p3-circuit-prover = { workspace = true, features = ["test-hooks"] }
 p3-air.workspace = true
 p3-challenger.workspace = true
 p3-dft.workspace = true

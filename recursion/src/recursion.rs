@@ -234,6 +234,20 @@ where
 }
 
 /// Parameters for the shared recursion pipeline (table packing, optional overrides).
+///
+/// # Zero knowledge
+///
+/// - **Hiding budget.** With a zero-knowledge PCS the layer prover refuses a `table_packing`
+///   whose `min_trace_height` is below `table_packing.zk_min_trace_height(challenge degree)`
+///   (`BatchStarkProverError::ZkTraceHeightBelowHidingBudget`, returned by
+///   [`prove_next_layer`] / [`prove_aggregation_layer`] as
+///   [`VerificationError::InvalidProofShape`] with that message). The [`Default`] packing has
+///   `min_trace_height` 1 and is therefore non-ZK only; for ZK start from
+///   `TablePacking::with_fri_params` (or `with_min_trace_height`) and declare the PCS's real
+///   FRI query count with `TablePacking::with_zk_num_queries` when it is not
+///   `DEFAULT_ZK_NUM_QUERIES` (54).
+/// - **Randomness.** See [`prove_next_layer`]: without a prep cache every call proves with a
+///   clone of `config`, so the PCS RNG must not replay on clone.
 #[derive(Clone, Debug)]
 pub struct ProveNextLayerParams {
     pub table_packing: TablePacking,
@@ -241,6 +255,8 @@ pub struct ProveNextLayerParams {
     pub constraint_profile: ConstraintProfile,
 }
 
+/// Non-ZK default: `TablePacking::new(1, 4)` (`min_trace_height` 1). Under a zero-knowledge PCS
+/// the layer provers reject it with the hiding-budget error; see [`ProveNextLayerParams`].
 impl Default for ProveNextLayerParams {
     fn default() -> Self {
         Self {
@@ -402,6 +418,20 @@ where
 ///
 /// Pass a [`NextLayerPrepCache`] produced by [`build_next_layer_prep`] to skip the LDE and
 /// Merkle-tree commitment for preprocessed columns on every layer.
+///
+/// # Zero knowledge: randomness
+///
+/// Without a prep cache, each call proves with a fresh `BatchStarkProver::new(config.clone())`.
+/// `HidingFriPcs::clone` copies the state of its RNG, and `config` itself is never advanced, so
+/// with an RNG whose `Clone` copies its state (a seeded `SmallRng`, `StdRng`, a ChaCha RNG, ...)
+/// two calls with the same `config` draw the same hiding randomness, including the same
+/// zero-knowledge LogUp masks: the difference of two such proofs' revealed sums is then the
+/// difference of their true sums. Under ZK, use an RNG whose `Clone` reseeds from fresh
+/// entropy, or a fresh config per call, or a prep cache (its prover's RNG advances from call to
+/// call).
+///
+/// Under ZK, `params.table_packing` must also meet the hiding budget (see
+/// [`ProveNextLayerParams`]).
 #[instrument(skip_all)]
 pub fn prove_next_layer<SC, A, B, const D: usize>(
     prev: &RecursionInput<'_, SC, A>,
@@ -651,6 +681,20 @@ where
 ///
 /// The two inputs may be different `RecursionInput` variants (e.g. one `UniStark` left
 /// and one `BatchStark` right) or identical ones.
+///
+/// # Zero knowledge: randomness
+///
+/// Without a matching prep cache, each call proves with a fresh `BatchStarkProver::new(config.clone())`.
+/// `HidingFriPcs::clone` copies the state of its RNG, and `config` itself is never advanced, so
+/// with an RNG whose `Clone` copies its state (a seeded `SmallRng`, `StdRng`, a ChaCha RNG, ...)
+/// two calls with the same `config` draw the same hiding randomness, including the same
+/// zero-knowledge LogUp masks: the difference of two such proofs' revealed sums is then the
+/// difference of their true sums. Under ZK, use an RNG whose `Clone` reseeds from fresh
+/// entropy, or a fresh config per call, or a prep cache (its prover's RNG advances from call to
+/// call).
+///
+/// Under ZK, `params.table_packing` must also meet the hiding budget (see
+/// [`ProveNextLayerParams`]).
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub fn prove_aggregation_layer<SC, A1, A2, B, const D: usize>(

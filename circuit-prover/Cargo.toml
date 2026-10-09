@@ -58,6 +58,9 @@ tracing-subscriber = { workspace = true, features = ["std", "env-filter"] }
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+# Test-only: exposes `BatchStarkProver::prove_all_tables_with_mask_hook`, which can alter the
+# zero-knowledge LogUp masks to build adversarial proofs. Never enable outside tests.
+test-hooks = ["p3-batch-stark/test-hooks"]
 
 [[bench]]
 name = "prover"

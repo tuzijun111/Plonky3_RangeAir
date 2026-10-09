@@ -7,8 +7,10 @@
 //!
 //! These tests cover the fork side: the in-circuit verifier derives the masked width from its
 //! own lookups and PCS type, accepts honest masked proofs (also with Poseidon2, recompose and
-//! packed-Horner ALU tables, over a recursion chain), rejects sum-preserving tampering and
-//! stripped mask columns, and builds a circuit that does not depend on the masks.
+//! packed-Horner ALU tables, over a recursion chain), rejects sum-preserving tampering (after
+//! the fact, and transcript-consistent through the test-only mask hook) and stripped mask
+//! columns, and builds a circuit that does not depend on the masks. All global lookups here are
+//! on the WitnessChecks bus; `zk_logup_mask_npo.rs` covers the NPO buses.
 
 mod common;
 
@@ -24,8 +26,8 @@ use p3_circuit_prover::batch_stark_prover::{
 use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
 use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, DEFAULT_ZK_MIN_TRACE_HEIGHT,
-    Poseidon2Preprocessor, Poseidon2Prover, RecomposePreprocessor, TablePacking, TableProver,
-    recompose_table_provers,
+    LookupMaskPlan, Poseidon2Preprocessor, Poseidon2Prover, RecomposePreprocessor, TablePacking,
+    TableProver, recompose_table_provers,
 };
 use p3_fri::{FriParameters, HidingFriPcs};
 use p3_lookup::logup::LogUpGadget;
@@ -131,6 +133,19 @@ fn fib_circuit(n: usize) -> (Circuit<F>, F) {
 
 /// Fibonacci circuit (Const/Public/ALU tables, all on the WitnessChecks bus) proved with ZK.
 fn prove_fib_zk(seed: u64) -> Proved<MyConfigZk> {
+    let p = prove_fib_zk_with(seed, None);
+    BatchStarkProver::new(zk_config(seed))
+        .with_table_packing(zk_packing(2, 4))
+        .verify_all_tables(&p.proof)
+        .expect("native verification of a masked ZK proof");
+    p
+}
+
+/// Test-only mask hook (see `BatchStarkProver::prove_all_tables_with_mask_hook`).
+type Hook<'a> = &'a mut dyn FnMut(&mut LookupMaskPlan<Challenge>);
+
+/// [`prove_fib_zk`], optionally through the test-only mask hook, without verifying.
+fn prove_fib_zk_with(seed: u64, hook: Option<Hook<'_>>) -> Proved<MyConfigZk> {
     let (circuit, result) = fib_circuit(100);
     let table_packing = zk_packing(2, 4);
     let config = zk_config(seed);
@@ -151,10 +166,12 @@ fn prove_fib_zk(seed: u64) -> Proved<MyConfigZk> {
     let prover_data = ProverData::from_airs_and_degrees(&config, &airs, &ext_degrees);
     let cpd = CircuitProverData::new(prover_data, pc, npc);
     let prover = BatchStarkProver::new(config).with_table_packing(table_packing);
-    let proof = prover.prove_all_tables(&traces, &cpd).unwrap();
-    prover
-        .verify_all_tables(&proof)
-        .expect("native verification of a masked ZK proof");
+    let proof = hook
+        .map_or_else(
+            || prover.prove_all_tables(&traces, &cpd),
+            |h| prover.prove_all_tables_with_mask_hook(&traces, &cpd, |p| h(p)),
+        )
+        .unwrap();
     Proved {
         proof,
         cpd,
@@ -438,8 +455,12 @@ fn nonzk_proof_has_no_mask_columns_and_verifies_in_circuit() {
         .expect("in-circuit verification of a non-ZK proof");
 }
 
-/// Moving `delta` between two revealed sums of the same bus keeps every per-bus total (so the
-/// global balance check passes) but breaks the last-row binding of both lookups.
+/// Moving `delta` between two revealed sums of the same bus after proving keeps every per-bus
+/// total (so the per-bus check passes). The revealed sums are absorbed into the transcript
+/// before the constraint challenge, so this edit also desynchronizes the challenges from the
+/// proof: the rejection here does not by itself show that the masked last-row binding is
+/// enforced. `zk_masked_in_circuit_rejects_transcript_consistent_same_bus_shift` isolates the
+/// binding.
 #[test]
 fn zk_masked_in_circuit_rejects_same_bus_tamper() {
     let mut tampered = prove_fib_zk(3);
@@ -478,6 +499,66 @@ fn zk_masked_in_circuit_rejects_same_bus_tamper() {
     println!("tampered in-circuit result: {res:?}");
     let err = res.expect_err("in-circuit verifier must reject a same-bus tamper");
     assert!(err.contains("WitnessConflict"), "unexpected error: {err}");
+}
+
+/// The same `+delta` / `-delta` shift on two WitnessChecks members, made by the prover through
+/// the test-only mask hook: the honest masks are committed, the shifted sums are revealed and
+/// absorbed into the transcript, so the challenges match the proof and the bus balances. Only
+/// the masked last-row binding `(c' - rho - s[n-1]) * den - num = 0` is violated: natively an
+/// out-of-domain mismatch, in circuit a conflict in the quotient identity.
+#[test]
+fn zk_masked_in_circuit_rejects_transcript_consistent_same_bus_shift() {
+    let seed = 7;
+    let delta = Challenge::from_u64(5);
+    let honest = prove_fib_zk(seed);
+    let entries: Vec<(usize, usize)> = honest
+        .proof
+        .proof
+        .global_lookup_data
+        .iter()
+        .enumerate()
+        .flat_map(|(i, v)| (0..v.len()).map(move |g| (i, g)))
+        .collect();
+    let a = entries[0];
+    let b = *entries
+        .iter()
+        .find(|(i, _)| *i != a.0)
+        .expect("a second table on WitnessChecks");
+    let mut hook = |plan: &mut LookupMaskPlan<Challenge>| {
+        plan.reveal_offsets[a.0][a.1] += delta;
+        plan.reveal_offsets[b.0][b.1] -= delta;
+    };
+    let forged = prove_fib_zk_with(seed, Some(&mut hook));
+
+    // Same seed, same masks and challenges: exactly the two revealed sums moved.
+    let (h, f) = (revealed_sums(&honest.proof), revealed_sums(&forged.proof));
+    let flat = |(i, g): (usize, usize)| entries.iter().position(|&e| e == (i, g)).unwrap();
+    for (k, (x, y)) in h.iter().zip(&f).enumerate() {
+        let expected = if k == flat(a) {
+            *x + delta
+        } else if k == flat(b) {
+            *x - delta
+        } else {
+            *x
+        };
+        assert_eq!(*y, expected, "revealed sum {k}");
+    }
+    assert_eq!(per_bus_sums(&forged.proof), per_bus_sums(&honest.proof));
+
+    let prover = BatchStarkProver::new(zk_config(8)).with_table_packing(zk_packing(2, 4));
+    let err = prover
+        .verify_all_tables(&forged.proof)
+        .expect_err("native verifier must reject");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("OodEvaluationMismatch"), "{msg}");
+
+    let built = build_verifier_zk::<1>(&forged, &[]).expect("shape is unchanged");
+    let err = run_verifier_zk(&built, &forged.proof)
+        .expect_err("in-circuit verifier must reject a transcript-consistent same-bus shift");
+    println!("transcript-consistent forgery, in circuit: {err}");
+    assert!(err.contains("WitnessConflict"), "unexpected error: {err}");
+    // Not the per-bus check (which would conflict with the bus total, here zero anyway).
+    assert!(!err.contains("WitnessId(0)"), "unexpected error: {err}");
 }
 
 /// The masked mode is fixed by the verifier's own width; stripping the mask columns from the

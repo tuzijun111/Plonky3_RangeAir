@@ -328,7 +328,8 @@ macro_rules! define_field_module {
 
                 let base_circuit = builder.build().unwrap();
                 let table_packing_0 = TablePacking::new(1, 1)
-                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
+                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
+                    .with_zk_num_queries(fri_params.num_queries(security_level));
 
                 let expected_fib = compute_fibonacci(n);
                 let traces_0 = {
@@ -391,10 +392,13 @@ macro_rules! define_field_module {
 
                         for layer in 1..=num_recursive_layers {
                             let params = ProveNextLayerParams {
-                                table_packing: table_packing.clone().with_fri_params(
-                                    fri_params.log_final_poly_len,
-                                    fri_params.log_blowup,
-                                ),
+                                table_packing: table_packing
+                                    .clone()
+                                    .with_fri_params(
+                                        fri_params.log_final_poly_len,
+                                        fri_params.log_blowup,
+                                    )
+                                    .with_zk_num_queries(fri_params.num_queries(security_level)),
                                 constraint_profile: ConstraintProfile::Standard,
                             };
                             let seed = stable_seed.unwrap_or(layer as u64);
@@ -580,7 +584,8 @@ macro_rules! define_field_module_quintic {
 
                 let base_circuit = builder.build().unwrap();
                 let table_packing_0 = TablePacking::new(1, 1)
-                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
+                    .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
+                    .with_zk_num_queries(fri_params.num_queries(security_level));
 
                 let expected_fib = compute_fibonacci(n);
                 let traces_0 = {
@@ -635,7 +640,8 @@ macro_rules! define_field_module_quintic {
                     let params = ProveNextLayerParams {
                         table_packing: table_packing
                             .clone()
-                            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup),
+                            .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup)
+                            .with_zk_num_queries(fri_params.num_queries(security_level)),
                         constraint_profile: ConstraintProfile::Standard,
                     };
                     let seed = stable_seed.unwrap_or(layer as u64);

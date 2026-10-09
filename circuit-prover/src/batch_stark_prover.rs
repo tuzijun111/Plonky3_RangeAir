@@ -50,7 +50,11 @@ mod recompose;
 pub use dynamic_air::{
     BatchAir, BatchTableInstance, CloneableBatchAir, DynamicAirEntry, TableProver,
 };
-pub use packing::{DEFAULT_ZK_MIN_TRACE_HEIGHT, TablePacking};
+#[cfg(feature = "test-hooks")]
+pub use p3_batch_stark::LookupMaskPlan;
+pub use packing::{
+    DEFAULT_ZK_MIN_TRACE_HEIGHT, DEFAULT_ZK_NUM_QUERIES, TablePacking, ZK_OPENING_POINTS,
+};
 pub use poseidon1::{
     Poseidon1AirBuilder, Poseidon1AirWrapperInner, Poseidon1Preprocessor, Poseidon1Prover,
     Poseidon1ProverD2, poseidon1_preprocessor, poseidon1_verifier_air_from_config,
@@ -505,6 +509,10 @@ where
     }
 }
 
+/// Test-only hook of [`BatchStarkProver::prove_all_tables_with_mask_hook`].
+#[cfg(feature = "test-hooks")]
+type MaskHook<'h, EF> = Box<dyn FnOnce(&mut LookupMaskPlan<EF>) + 'h>;
+
 /// Produces a single batch STARK proof covering all circuit tables.
 pub struct BatchStarkProver<SC>
 where
@@ -616,12 +624,17 @@ pub enum BatchStarkProverError {
     /// A zero-knowledge proof was requested with tables that may be shorter than the hiding
     /// budget ([`TablePacking::zk_min_trace_height`]).
     #[error(
-        "ZK proving requires min_trace_height >= {required} (hiding budget), got {min_trace_height}; \
-         raise it with TablePacking::with_fri_params / with_min_trace_height"
+        "ZK proving requires min_trace_height >= {required} (hiding budget for {num_queries} FRI \
+         queries and a degree-{challenge_degree} challenge field), got {min_trace_height}; raise \
+         it with TablePacking::with_min_trace_height / with_fri_params (the default packing, \
+         min_trace_height 1, is for non-ZK proving only), and declare the PCS's real FRI query \
+         count with TablePacking::with_zk_num_queries"
     )]
     ZkTraceHeightBelowHidingBudget {
         min_trace_height: usize,
         required: usize,
+        num_queries: usize,
+        challenge_degree: usize,
     },
 }
 
@@ -1033,14 +1046,64 @@ where
         EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
         SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
     {
+        self.prove_all_tables_inner(
+            traces,
+            circuit_prover_data,
+            #[cfg(feature = "test-hooks")]
+            None,
+        )
+    }
+
+    /// [`Self::prove_all_tables`] through `p3_batch_stark::prove_batch_with_mask_hook`: `hook`
+    /// may read or alter the zero-knowledge LogUp masks (committed masks and offsets on the
+    /// revealed sums, indexed `[table][global lookup]`) to build adversarial proofs whose
+    /// transcript is consistent with what they reveal.
+    ///
+    /// Test-only (`test-hooks` feature, off by default; never enable it outside tests). The hook
+    /// runs once, and only when the PCS is zero-knowledge.
+    #[cfg(feature = "test-hooks")]
+    pub fn prove_all_tables_with_mask_hook<'h, EF>(
+        &self,
+        traces: &Traces<EF>,
+        circuit_prover_data: &CircuitProverData<SC>,
+        hook: impl FnOnce(&mut LookupMaskPlan<SC::Challenge>) + 'h,
+    ) -> Result<BatchStarkProof<SC>, BatchStarkProverError>
+    where
+        EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+    {
+        self.prove_all_tables_inner(traces, circuit_prover_data, Some(Box::new(hook)))
+    }
+
+    fn prove_all_tables_inner<EF>(
+        &self,
+        traces: &Traces<EF>,
+        circuit_prover_data: &CircuitProverData<SC>,
+        #[cfg(feature = "test-hooks")] mask_hook: Option<MaskHook<'_, SC::Challenge>>,
+    ) -> Result<BatchStarkProof<SC>, BatchStarkProverError>
+    where
+        EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SymbolicExpression<Val<SC>>>,
+    {
         let w_opt = EF::extract_w();
+        macro_rules! prove_d {
+            ($d:literal, $w:expr) => {
+                self.prove::<EF, $d>(
+                    traces,
+                    $w,
+                    circuit_prover_data,
+                    #[cfg(feature = "test-hooks")]
+                    mask_hook,
+                )
+            };
+        }
         match EF::DIMENSION {
-            1 => self.prove::<EF, 1>(traces, None, circuit_prover_data),
-            2 => self.prove::<EF, 2>(traces, w_opt, circuit_prover_data),
-            4 => self.prove::<EF, 4>(traces, w_opt, circuit_prover_data),
-            5 => self.prove::<EF, 5>(traces, w_opt, circuit_prover_data),
-            6 => self.prove::<EF, 6>(traces, w_opt, circuit_prover_data),
-            8 => self.prove::<EF, 8>(traces, w_opt, circuit_prover_data),
+            1 => prove_d!(1, None),
+            2 => prove_d!(2, w_opt),
+            4 => prove_d!(4, w_opt),
+            5 => prove_d!(5, w_opt),
+            6 => prove_d!(6, w_opt),
+            8 => prove_d!(8, w_opt),
             d => Err(BatchStarkProverError::UnsupportedDegree(d)),
         }
     }
@@ -1134,6 +1197,7 @@ where
         traces: &Traces<EF>,
         w_binomial: Option<Val<SC>>,
         circuit_prover_data: &CircuitProverData<SC>,
+        #[cfg(feature = "test-hooks")] mask_hook: Option<MaskHook<'_, SC::Challenge>>,
     ) -> Result<BatchStarkProof<SC>, BatchStarkProverError>
     where
         EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
@@ -1157,12 +1221,19 @@ where
         // Hiding budget: under ZK every table (padded to at least `min_height` rows below) must be
         // tall enough for its randomized columns, including the LogUp masks and the auxiliary
         // columns, to stay hidden given what the openings reveal. The pinned `HidingFriPcs` does
-        // not enforce this, so refuse to produce a proof that might not be zero-knowledge.
-        if self.config.is_zk() != 0 && min_height < packing.zk_min_trace_height() {
-            return Err(BatchStarkProverError::ZkTraceHeightBelowHidingBudget {
-                min_trace_height: min_height,
-                required: packing.zk_min_trace_height(),
-            });
+        // not enforce this, so refuse to produce a proof that might not be zero-knowledge. The
+        // budget uses the real challenge degree and the declared FRI query count.
+        if self.config.is_zk() != 0 {
+            let challenge_degree = <SC::Challenge as BasedVectorSpace<Val<SC>>>::DIMENSION;
+            let required = packing.zk_min_trace_height(challenge_degree);
+            if min_height < required {
+                return Err(BatchStarkProverError::ZkTraceHeightBelowHidingBudget {
+                    min_trace_height: min_height,
+                    required,
+                    num_queries: packing.zk_num_queries(),
+                    challenge_degree,
+                });
+            }
         }
 
         // Check if Alu table has only dummy operations (trace length <= 1).
@@ -1489,7 +1560,22 @@ where
                 check_lookups(&debug_instances);
             }
 
-            p3_batch_stark::prove_batch(&self.config, &instances, effective_prover_data)
+            #[cfg(feature = "test-hooks")]
+            let proof = mask_hook.map_or_else(
+                || p3_batch_stark::prove_batch(&self.config, &instances, effective_prover_data),
+                |hook| {
+                    p3_batch_stark::prove_batch_with_mask_hook(
+                        &self.config,
+                        &instances,
+                        effective_prover_data,
+                        hook,
+                    )
+                },
+            );
+            #[cfg(not(feature = "test-hooks"))]
+            let proof =
+                p3_batch_stark::prove_batch(&self.config, &instances, effective_prover_data);
+            proof
         };
 
         let dynamic_public_values = public_storage.drain(NUM_PRIMITIVE_TABLES..);

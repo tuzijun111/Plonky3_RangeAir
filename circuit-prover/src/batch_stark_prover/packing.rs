@@ -7,8 +7,9 @@ use crate::ProofMetadataError;
 
 /// Configuration for packing multiple primitive operations into a single AIR row.
 ///
-/// Equality ignores [`Self::zk_min_trace_height`], which is a prover-side policy and is not
-/// serialized (so the proof metadata, and the bytes of serialized proofs, are unchanged by it).
+/// Equality ignores the zero-knowledge hiding-budget settings ([`Self::zk_num_queries`] and the
+/// floor set by [`Self::with_zk_min_trace_height`]), which are prover-side policy and are not
+/// serialized (so the proof metadata, and the bytes of serialized proofs, are unchanged by them).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TablePacking {
     /// Number of public-input operations packed per AIR row.
@@ -27,17 +28,33 @@ pub struct TablePacking {
     /// Must be at least 2. Default 2 matches the previous double-step Horner layout.
     #[serde(default = "default_horner_pack_k")]
     horner_packed_steps: usize,
-    /// Smallest `min_trace_height` accepted when proving with a zero-knowledge PCS (the
-    /// hiding budget). Prover-side only: never serialized, ignored by equality.
-    #[serde(skip, default = "default_zk_min_trace_height")]
-    zk_min_trace_height: usize,
+    /// FRI query count the zero-knowledge hiding budget is computed for (see
+    /// [`Self::zk_min_trace_height`]). Prover-side only: never serialized, ignored by equality.
+    #[serde(skip, default = "default_zk_num_queries")]
+    zk_num_queries: usize,
+    /// Optional extra lower bound on `min_trace_height` under ZK, on top of the hiding budget
+    /// (0 = none). It can only raise the requirement. Prover-side only, like `zk_num_queries`.
+    #[serde(skip)]
+    zk_min_trace_height_floor: usize,
 }
 
 const fn default_horner_pack_k() -> usize {
     2
 }
 
-/// Default hiding budget for [`TablePacking::zk_min_trace_height`].
+/// FRI query count assumed by the zero-knowledge hiding budget unless the caller declares the
+/// real one with [`TablePacking::with_zk_num_queries`].
+///
+/// 54 is the query count of the configuration this fork is used with (log blowup 2); a caller
+/// whose FRI parameters use more queries (for example log blowup 1 at the same security level)
+/// must declare it, or the guard in [`super::BatchStarkProver`] under-estimates the budget.
+pub const DEFAULT_ZK_NUM_QUERIES: usize = 54;
+
+/// Out-of-domain opening points of every committed main column (`zeta` and `g * zeta`).
+pub const ZK_OPENING_POINTS: usize = 2;
+
+/// Hiding budget for the default query count and a degree-4 challenge field:
+/// `zk_hiding_budget(54, 4, 2) = 128` (see [`TablePacking::zk_hiding_budget`]).
 ///
 /// Under ZK each committed column of a table of base height `n` is a polynomial of degree below
 /// `2n` with `n` random interleaved rows. The verifier learns `D` base-field values per
@@ -45,10 +62,13 @@ const fn default_horner_pack_k() -> usize {
 /// jointly uniform, so the column stays hidden, when `n >= 2 * (num_queries + D * points)`. For
 /// `num_queries = 54`, `D = 4` and 2 points this is 124, rounded up to the next power of two:
 /// 128. This covers the LogUp masks and the auxiliary (permutation) columns.
-pub const DEFAULT_ZK_MIN_TRACE_HEIGHT: usize = 128;
+pub const DEFAULT_ZK_MIN_TRACE_HEIGHT: usize =
+    TablePacking::zk_hiding_budget(DEFAULT_ZK_NUM_QUERIES, 4, ZK_OPENING_POINTS);
 
-const fn default_zk_min_trace_height() -> usize {
-    DEFAULT_ZK_MIN_TRACE_HEIGHT
+const _: () = assert!(DEFAULT_ZK_MIN_TRACE_HEIGHT == 128);
+
+const fn default_zk_num_queries() -> usize {
+    DEFAULT_ZK_NUM_QUERIES
 }
 
 impl PartialEq for TablePacking {
@@ -60,7 +80,8 @@ impl PartialEq for TablePacking {
             npo_lanes,
             min_trace_height,
             horner_packed_steps,
-            zk_min_trace_height: _,
+            zk_num_queries: _,
+            zk_min_trace_height_floor: _,
         } = self;
         *public_lanes == other.public_lanes
             && *alu_lanes == other.alu_lanes
@@ -91,7 +112,8 @@ impl TablePacking {
             npo_lanes: Vec::new(),
             min_trace_height: 1,
             horner_packed_steps: 2,
-            zk_min_trace_height: DEFAULT_ZK_MIN_TRACE_HEIGHT,
+            zk_num_queries: DEFAULT_ZK_NUM_QUERIES,
+            zk_min_trace_height_floor: 0,
         }
     }
 
@@ -188,31 +210,62 @@ impl TablePacking {
     }
 
     /// Smallest [`Self::min_trace_height`] that [`super::BatchStarkProver`] accepts when the
-    /// PCS is zero-knowledge (default [`DEFAULT_ZK_MIN_TRACE_HEIGHT`]).
+    /// PCS is zero-knowledge and the challenge field has degree `challenge_degree` over the base
+    /// field: the hiding budget `zk_hiding_budget(zk_num_queries, challenge_degree, 2)`, or the
+    /// floor set by [`Self::with_zk_min_trace_height`] if that is larger.
     ///
     /// Every table is padded to at least `min_trace_height` rows, so this bounds the base
     /// height of every committed table from below. A table is hidden only if its base height
     /// exceeds the number of linear functionals the verifier learns about each column; see
-    /// [`Self::zk_hiding_budget`]. The pinned `HidingFriPcs` does not check this itself.
-    pub const fn zk_min_trace_height(&self) -> usize {
-        self.zk_min_trace_height
+    /// [`Self::zk_hiding_budget`]. The pinned `HidingFriPcs` does not check this itself, and
+    /// it does not expose its FRI query count, so the count is a declared parameter
+    /// ([`Self::with_zk_num_queries`], default [`DEFAULT_ZK_NUM_QUERIES`]). For the default
+    /// query count and a degree-4 challenge field this is [`DEFAULT_ZK_MIN_TRACE_HEIGHT`] (128).
+    pub const fn zk_min_trace_height(&self, challenge_degree: usize) -> usize {
+        let budget =
+            Self::zk_hiding_budget(self.zk_num_queries, challenge_degree, ZK_OPENING_POINTS);
+        if self.zk_min_trace_height_floor > budget {
+            self.zk_min_trace_height_floor
+        } else {
+            budget
+        }
     }
 
-    /// Override the ZK hiding budget (see [`Self::zk_min_trace_height`]).
+    /// FRI query count the ZK hiding budget is computed for (default [`DEFAULT_ZK_NUM_QUERIES`]).
+    pub const fn zk_num_queries(&self) -> usize {
+        self.zk_num_queries
+    }
+
+    /// Declare the FRI query count of the PCS this packing is proved with, so that the ZK hiding
+    /// budget ([`Self::zk_min_trace_height`]) matches it.
     ///
-    /// Only lower it below [`DEFAULT_ZK_MIN_TRACE_HEIGHT`] when the FRI parameters in use reveal
-    /// fewer values, i.e. to at least `zk_hiding_budget(num_queries, D, 2)` for those parameters
-    /// (for example in tests with few queries). Proofs below the budget are still sound but may
-    /// leak the masked LogUp sums and auxiliary columns.
+    /// A caller whose FRI parameters use more than [`DEFAULT_ZK_NUM_QUERIES`] queries must call
+    /// this (with the real `num_queries`), and then raise [`Self::min_trace_height`] to the
+    /// budget if needed; otherwise ZK proving under-estimates the budget. Declaring fewer queries
+    /// than the PCS really uses weakens hiding. Has no effect without ZK.
+    #[must_use]
+    pub const fn with_zk_num_queries(mut self, num_queries: usize) -> Self {
+        self.zk_num_queries = num_queries;
+        self
+    }
+
+    /// Require `min_trace_height >= zk_min_trace_height` under ZK in addition to the hiding
+    /// budget (a stricter policy). This can only raise the requirement: values at or below the
+    /// budget derived from [`Self::zk_num_queries`] have no effect, so it cannot switch the
+    /// guard off. To lower the budget, declare the real (smaller) query count with
+    /// [`Self::with_zk_num_queries`].
     #[must_use]
     pub const fn with_zk_min_trace_height(mut self, zk_min_trace_height: usize) -> Self {
-        self.zk_min_trace_height = zk_min_trace_height;
+        self.zk_min_trace_height_floor = zk_min_trace_height;
         self
     }
 
     /// Hiding budget for the given FRI query count, extension degree and number of out-of-domain
     /// opening points: `2 * (num_queries + ext_degree * opening_points)`, rounded up to a power of
     /// two. For 54 queries, `D = 4` and 2 points (`zeta`, `g * zeta`) this is 128.
+    ///
+    /// The factor 2 is the design's sufficient margin over the tight count
+    /// `num_queries + ext_degree * opening_points`; it is not independently proven tight.
     pub const fn zk_hiding_budget(
         num_queries: usize,
         ext_degree: usize,

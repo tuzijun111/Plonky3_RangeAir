@@ -71,6 +71,14 @@ pub struct FriParams {
     pub query_pow_bits: usize,
 }
 
+impl FriParams {
+    /// FRI query count for `security_level` (the same formula as the configs below). Declared
+    /// to `TablePacking::with_zk_num_queries` so that the ZK hiding budget matches the PCS.
+    pub const fn num_queries(&self, security_level: usize) -> usize {
+        (security_level - self.query_pow_bits) / self.log_blowup
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum FieldOption {
     KoalaBear,

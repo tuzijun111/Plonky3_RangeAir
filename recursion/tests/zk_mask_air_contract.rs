@@ -9,8 +9,13 @@
 //! (`check_constraints`), which trips the width assertions of an AIR that breaks the contract
 //! (before the fix: the ALU `debug_assert_eq!` on the window length and the Poseidon2 row
 //! `Borrow` suffix assertion).
+//!
+//! Tables covered: Const, Public, ALU (with packed Horner), Poseidon2 and recompose (the
+//! recursion verifier circuit), and Permute, Range (D=1 `add_range` and D=4 `add_range_bits`),
+//! Expose (with public values) and Poseidon1 (the NPO fixtures of `zk_mask_common`).
 
 mod common;
+mod zk_mask_common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +28,7 @@ use p3_batch_stark::symbolic::get_symbolic_constraints;
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
 use p3_circuit::{Circuit, CircuitBuilder, Traces};
 use p3_circuit_prover::batch_stark_prover::{poseidon2_air_builders, recompose_air_builders};
-use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
+use p3_circuit_prover::common::{CircuitTableAir, NpoPreprocessor, get_airs_and_degrees_with_prep};
 use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, DEFAULT_ZK_MIN_TRACE_HEIGHT,
     Poseidon2Preprocessor, RecomposePreprocessor, TablePacking,
@@ -312,28 +317,21 @@ fn eval_at(
     }
 }
 
-/// Every table AIR of a recursion circuit has the same constraint polynomials whether its
-/// main window is exactly `width()` or carries trailing mask columns: same number, same
-/// degrees, and equal values at a random point (variables beyond `width()` would get fresh
-/// random values and change them).
-#[test]
-fn air_constraints_do_not_depend_on_main_window_width() {
-    let (vc, _) = verifier_circuit_and_traces();
-    let packing = TablePacking::new(1, 8).with_min_trace_height(DEFAULT_ZK_MIN_TRACE_HEIGHT);
-    let cz = zk_config(8);
-    let (airs, cpd) = verifier_airs!(MyConfigZk, cz, &vc, &packing);
+/// Check that every table AIR in `airs` has the same constraint polynomials whether its main
+/// window is exactly `width()` or carries trailing mask columns: same number, same degrees,
+/// and equal values at a random point (variables beyond `width()` would get fresh random
+/// values and change them). Returns, per table, `(width, number of base constraints)`.
+fn assert_constraints_window_independent<const TD: usize>(
+    label: &str,
+    airs: &[CircuitTableAir<MyConfigZk, TD>],
+    cpd: &CircuitProverData<MyConfigZk>,
+    seed: u64,
+) -> Vec<(usize, usize)> {
     let lookups = &cpd.common_data().lookups;
     let gadget = LogUpGadget::new();
-    let mut rng = SmallRng::seed_from_u64(0x5eed);
+    let mut rng = SmallRng::seed_from_u64(seed);
     let selectors: [F; 3] = [rng.random(), rng.random(), rng.random()];
-    let mut checked_constraints = 0;
-    assert!(
-        airs.iter()
-            .filter(|a| BaseAir::<F>::width(*a) >= 100)
-            .count()
-            >= 2,
-        "the fixture must contain the ALU (packed Horner) and Poseidon2 tables"
-    );
+    let mut out = Vec::with_capacity(airs.len());
 
     for (i, air) in airs.iter().enumerate() {
         let w = BaseAir::<F>::width(air);
@@ -353,19 +351,13 @@ fn air_constraints_do_not_depend_on_main_window_width() {
         assert_eq!(
             base_plain.len(),
             base_wide.len(),
-            "table {i}: base constraint count"
+            "{label} table {i}: base constraint count"
         );
         assert_eq!(
             ext_plain.len(),
             ext_wide.len(),
-            "table {i}: ext constraint count"
+            "{label} table {i}: ext constraint count"
         );
-        // (Some tables, e.g. Public, have no AIR constraints of their own, only lookups.)
-        checked_constraints += base_plain.len();
-        if w >= 100 {
-            // The wide tables (ALU with packed Horner, Poseidon2) must actually be exercised.
-            assert!(!base_plain.is_empty(), "table {i}: no AIR constraints");
-        }
 
         let mut point = HashMap::new();
         let mut memo_plain = HashMap::new();
@@ -374,25 +366,102 @@ fn air_constraints_do_not_depend_on_main_window_width() {
             assert_eq!(
                 cp.degree_multiple(),
                 cw.degree_multiple(),
-                "table {i}: constraint {k} degree"
+                "{label} table {i}: constraint {k} degree"
             );
             let vp = eval_at(cp, &mut point, &mut rng, selectors, &mut memo_plain);
             let vw = eval_at(cw, &mut point, &mut rng, selectors, &mut memo_wide);
             assert_eq!(
                 vp, vw,
-                "table {i}: constraint {k} differs with a wider window"
+                "{label} table {i}: constraint {k} differs with a wider window"
             );
         }
         assert!(
             point
                 .keys()
                 .all(|(e, idx)| !matches!(e, BaseEntry::Main { .. }) || *idx < w),
-            "table {i}: an AIR constraint reads a main column beyond width() = {w}"
+            "{label} table {i}: an AIR constraint reads a main column beyond width() = {w}"
         );
         println!(
-            "table {i}: width {w} (+{extra}), {} base constraints identical",
+            "{label} table {i}: width {w} (+{extra}), public values {}, {} base constraints \
+             identical",
+            BaseAir::<F>::num_public_values(air),
             base_plain.len()
         );
+        out.push((w, base_plain.len()));
     }
-    assert!(checked_constraints > 0);
+    out
+}
+
+/// Every table AIR of a recursion circuit has the same constraint polynomials whether its
+/// main window is exactly `width()` or carries trailing mask columns.
+#[test]
+fn air_constraints_do_not_depend_on_main_window_width() {
+    let (vc, _) = verifier_circuit_and_traces();
+    let packing = TablePacking::new(1, 8).with_min_trace_height(DEFAULT_ZK_MIN_TRACE_HEIGHT);
+    let cz = zk_config(8);
+    let (airs, cpd) = verifier_airs!(MyConfigZk, cz, &vc, &packing);
+    assert!(
+        airs.iter()
+            .filter(|a| BaseAir::<F>::width(*a) >= 100)
+            .count()
+            >= 2,
+        "the fixture must contain the ALU (packed Horner) and Poseidon2 tables"
+    );
+    let tables = assert_constraints_window_independent("verifier", &airs, &cpd, 0x5eed);
+    // (Some tables, e.g. Public, have no AIR constraints of their own, only lookups.)
+    assert!(tables.iter().map(|t| t.1).sum::<usize>() > 0);
+    for (i, &(w, n)) in tables.iter().enumerate() {
+        if w >= 100 {
+            // The wide tables (ALU with packed Horner, Poseidon2) must actually be exercised.
+            assert!(n > 0, "table {i}: no AIR constraints");
+        }
+    }
+}
+
+/// The same check for the NPO tables zkSketch depends on: Permute, Range (D=1 and the D=4
+/// byte decomposition), Expose (an AIR with public values) and Poseidon1.
+#[test]
+fn npo_air_constraints_do_not_depend_on_main_window_width() {
+    let d1 = zk_mask_common::multibus_d1();
+    let s1 = d1.setup(1);
+    let t1 = assert_constraints_window_independent(d1.name, &s1.airs, &s1.cpd, 1);
+    let d4 = zk_mask_common::npo_d4();
+    let s4 = d4.setup(2);
+    let t4 = assert_constraints_window_independent(d4.name, &s4.airs, &s4.cpd, 2);
+    // Const, Public, ALU + Permute, Range, Expose; and + Poseidon1 at D=4.
+    assert_eq!(t1.len(), 6, "{t1:?}");
+    assert_eq!(t4.len(), 7, "{t4:?}");
+    // Every NPO table has AIR constraints of its own, except possibly Range (pure lookups).
+    let with_constraints = t1[3..].iter().chain(&t4[3..]).filter(|t| t.1 > 0).count();
+    assert!(with_constraints >= 4, "{t1:?} {t4:?}");
+    // The Expose AIR reads public values.
+    assert!(
+        s1.airs
+            .iter()
+            .any(|a| BaseAir::<F>::num_public_values(a) > 0)
+            && s4
+                .airs
+                .iter()
+                .any(|a| BaseAir::<F>::num_public_values(a) > 0)
+    );
+}
+
+/// Masked ZK proofs of the NPO fixtures. In a debug build the prover runs `check_constraints`
+/// on the masked trace of every table (Permute, Range, Expose, Poseidon1 and the primitive
+/// tables), so this is the AIR-contract check for them; it also verifies natively.
+#[test]
+fn zk_masked_proof_of_npo_fixtures_respects_air_contract() {
+    let d1 = zk_mask_common::multibus_d1();
+    let p1 = d1.prove(3, None);
+    d1.verify_native(&p1)
+        .expect("native verification (D=1 fixture)");
+    let d4 = zk_mask_common::npo_d4();
+    let p4 = d4.prove(4, None);
+    d4.verify_native(&p4)
+        .expect("native verification (D=4 fixture)");
+    for (name, p) in [(d1.name, &p1), (d4.name, &p4)] {
+        let widths = zk_mask_common::opened_main_widths(p);
+        assert_eq!(widths, zk_mask_common::expected_masked_widths(p));
+        println!("{name}: AIR widths {:?} -> masked {widths:?}", p.air_widths);
+    }
 }

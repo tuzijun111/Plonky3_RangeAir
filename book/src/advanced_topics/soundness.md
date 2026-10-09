@@ -80,25 +80,50 @@ deterministic function of the witness and of challenges the verifier can recompu
   sampled, so they are constants fixed in advance and cannot balance an unbalanced bus. Only the
   last-row LogUp binding reads them: `(c' - rho - s[n-1]) * den - num = 0`, and the revealed value
   is `c' = rho + (true sum)`. The per-bus check that the revealed values sum to zero is unchanged.
-- The lookup mode is fixed by the committed main width. Every verifier (native, in-circuit in
-  `verify_batch_circuit`, and the transcript replay in `generate_batch_challenges`) derives the
-  expected width as `width() + lookup_mask_width(lookups, D, SC::Pcs::ZK)` from its own lookups
-  and configuration, never from the proof, checks the opened width against it, and binds it in
-  the transcript. Without ZK the width, the constraints and the proofs are unchanged.
+- The lookup mode is fixed by the committed main width. The native verifier
+  (`BatchStarkProver::verify_all_tables`, which rebuilds the lookups from AIRs it reconstructs
+  itself, then the core `verify_batch`) and the in-circuit verifier
+  (`verify_p3_batch_proof_circuit`, which rebuilds them the same way before
+  `verify_batch_circuit`) derive the expected width as
+  `width() + lookup_mask_width(lookups, D, SC::Pcs::ZK)` from those lookups and their own
+  configuration, never from the proof, check the opened width against it, and bind it in the
+  transcript. The prover-side transcript replay `generate_batch_challenges` only binds the width
+  it derives from the lookups it is given (`common_data.lookups`); it does not check opened
+  widths. Without ZK the width, the constraints and the proofs are unchanged.
 
 Requirements:
 
 - **AIR contract.** Under ZK an AIR with global lookups sees trailing mask columns in its main
   window. It must only read its own `width()` columns, must not assert on the window length and
   must not let its constraint set depend on it (the ALU and the Poseidon1/Poseidon2 circuit AIRs
-  follow this; `recursion/tests/zk_mask_air_contract.rs` checks every recursion table).
+  follow this). `recursion/tests/zk_mask_air_contract.rs` checks the Const, Public, ALU (with
+  packed Horner), Poseidon2, recompose, Permute, Range (D=1 `add_range` and D=4
+  `add_range_bits`), Expose and Poseidon1 tables, symbolically and, in a debug build, by
+  proving masked traces. Other tables (for example a new NPO) are not covered until added there.
 - **Hiding budget.** A column is hidden only if its table is taller than the number of values the
   verifier learns about it (openings at `zeta` and `g * zeta`, one value per FRI query). Under ZK
   `BatchStarkProver` refuses a `TablePacking` whose `min_trace_height` is below
-  `zk_min_trace_height` (default 128 = `zk_hiding_budget(54, 4, 2)`); lower it only for FRI
-  parameters with fewer queries.
-- **Randomness.** The PCS RNG must be a CSPRNG that is not replayed across proofs (seeded test
-  RNGs, or clones of a PCS whose RNG copies its state, replay the masks).
+  `zk_min_trace_height(challenge degree)`: the budget
+  `zk_hiding_budget(num_queries, challenge degree, 2) = next_pow2(2 * (num_queries + 2 * degree))`
+  (128 for 54 queries and degree 4), or a larger floor set with `with_zk_min_trace_height`
+  (which can only raise it). The PCS does not expose its query count, so the count is declared
+  with `with_zk_num_queries` (default `DEFAULT_ZK_NUM_QUERIES` = 54); a caller with more queries
+  must declare them, and declaring fewer than the PCS uses weakens hiding. The default packing
+  (`min_trace_height` 1, also used by `ProveNextLayerParams::default`) is non-ZK only.
+- **Randomness.** The PCS RNG must be a CSPRNG that is not replayed across proofs. Seeded test
+  RNGs replay the masks, and so do clones of a PCS whose RNG copies its state on clone:
+  `prove_next_layer` and `prove_aggregation_layer` without a prep cache prove with a fresh
+  `config.clone()` on every call, so under ZK their config's RNG must reseed on clone.
+
+Tests: `recursion/tests/zk_logup_mask.rs` (WitnessChecks only) and
+`recursion/tests/zk_logup_mask_npo.rs` (PermuteBus, RangeBus and WitnessChecks, with Permute,
+Range, Expose and Poseidon1 tables) verify honest masked proofs natively and in circuit, and
+reject forgeries made by the prover through the test-only mask hook
+(`BatchStarkProver::prove_all_tables_with_mask_hook`, feature `test-hooks`), whose transcripts
+are consistent with what they reveal: a same-bus shift of the revealed sums or a mask offset
+cancelled in the revealed sum (caught by the last-row binding), and masks that do not sum to zero
+on a bus or that cancel across two buses (caught by the per-bus check). A zero-sum
+re-randomization of one bus's masks is accepted.
 
 Still revealed under ZK: table heights, public values, and the masked sums themselves (uniform
 subject to summing to zero per bus).
