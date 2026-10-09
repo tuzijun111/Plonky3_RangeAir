@@ -2,8 +2,9 @@
 //! circuit prover produces and the in-circuit verifier circuits built for them.
 //!
 //! The golden values were produced by this fork at fbcc78f against Plonky3 56952503 (before the
-//! masks), with the default (sequential) build of these tests. They depend on the transcript,
-//! the AIRs and the proof serialization, so any change of the non-ZK path shows up here.
+//! masks). They depend on the transcript, the AIRs and the proof serialization, so any change of
+//! the non-ZK path shows up here. The FRI proof-of-work bits are 0 (the grinding witness is then
+//! fixed), so the proofs are deterministic with and without the `parallel` feature.
 
 mod common;
 
@@ -43,6 +44,23 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+/// The test config with the proof-of-work bits set to 0: grinding then returns a fixed witness
+/// instead of the first one some thread finds, so proofs are deterministic in parallel builds.
+fn config() -> MyConfig {
+    let perm = default_koalabear_poseidon2_16();
+    let hash = MyHash::new(perm.clone());
+    let compress = MyCompress::new(perm.clone());
+    let val_mmcs = MyMmcs::new(hash, compress, 0);
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+    let fri_params = FriParameters {
+        commit_proof_of_work_bits: 0,
+        query_proof_of_work_bits: 0,
+        ..FriParameters::new_testing(challenge_mmcs, 0)
+    };
+    let pcs = MyPcs::new(Dft::default(), val_mmcs, fri_params);
+    MyConfig::new(pcs, Challenger::new(perm))
+}
+
 fn proof_digest(p: &BatchStarkProof<MyConfig>) -> (usize, u64) {
     let bytes = postcard::to_allocvec(p).unwrap();
     (bytes.len(), fnv1a(&bytes))
@@ -71,7 +89,7 @@ fn fib_proof() -> (BatchStarkProof<MyConfig>, CircuitProverData<MyConfig>) {
     }
     let circuit = builder.build().unwrap();
     let table_packing = TablePacking::new(2, 4);
-    let config = make_test_config();
+    let config = config();
     let (airs_degrees, pc, npc) = get_airs_and_degrees_with_prep::<MyConfig, _, 1>(
         &circuit,
         &table_packing,
@@ -102,8 +120,8 @@ fn verifier_circuit(
     let fvp = FriVerifierParams::with_mmcs(
         s.log_blowup,
         s.log_final_poly_len,
-        s.commit_pow_bits,
-        s.query_pow_bits,
+        0,
+        0,
         s.num_queries,
         POSEIDON2,
     );
@@ -124,7 +142,7 @@ fn verifier_circuit(
         RATE,
         1,
     >(
-        &make_test_config(),
+        &config(),
         &mut cb,
         proof,
         &fvp,
@@ -166,7 +184,7 @@ fn verifier_circuit_proof(
     traces: &Traces<Challenge>,
 ) -> BatchStarkProof<MyConfig> {
     let packing = TablePacking::new(1, 8);
-    let config = make_test_config();
+    let config = config();
     let npo_prep: Vec<Box<dyn NpoPreprocessor<F>>> = vec![
         Box::new(Poseidon2Preprocessor),
         Box::new(RecomposePreprocessor::new(true)),
@@ -217,7 +235,7 @@ fn nonzk_proofs_and_verifier_circuits_are_unchanged() {
 /// (byte length or op count, FNV-1a 64) of: the Fibonacci proof, its verifier circuit's ops,
 /// and the proof of that verifier circuit; from fbcc78f on Plonky3 56952503.
 const GOLDEN: [(usize, u64); 3] = [
-    (7521, 0x6051_b672_7281_0cda),
-    (4172, 0x9a43_ea44_9151_70e8),
-    (43393, 0x2708_b985_2120_d261),
+    (7532, 0x6b6d_10b7_55e1_1fcd),
+    (3351, 0x1885_0091_6726_81dc),
+    (43257, 0x013d_1269_2517_3eba),
 ];
